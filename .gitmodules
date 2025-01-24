@@ -1,0 +1,6 @@
+[submodule "meshoptimizer"]
+	path = meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git
+[submodule "nv_cluster_builder"]
+	path = nv_cluster_builder
+	url = ../nv_cluster_builder.git

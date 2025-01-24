@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="313.02"
+   height="183.11"
+   version="1.1"
+   viewBox="0 0 313.02 183.11"
+   id="svg35"
+   sodipodi:docname="arcsin_angular_error.svg"
+   inkscape:version="1.3.2 (091e20ef0f, 2023-11-25)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview35"
+     pagecolor="#ffffff"
+     bordercolor="#111111"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="1"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="5.52999"
+     inkscape:cx="33.815613"
+     inkscape:cy="93.128559"
+     inkscape:window-width="1278"
+     inkscape:window-height="653"
+     inkscape:window-x="1998"
+     inkscape:window-y="216"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="svg35" />
+  <style
+     id="style1">
+    @media (prefers-color-scheme: light) {
+      .bg { fill: white; }
+      .fg-stroke { stroke: #333333; }
+      .fg-fill { fill: #333333; }
+    }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #333333; }
+      .fg-stroke { stroke: #dddddd; }
+      .fg-fill { fill: #dddddd; }
+    }
+ </style>
+  <g
+     transform="translate(-82 -822.98)"
+     id="g35">
+    <g
+       fill="#b6d7a8"
+       fill-rule="evenodd"
+       stroke="#595959"
+       stroke-linejoin="round"
+       stroke-miterlimit="8"
+       stroke-width="1143"
+       id="g25">
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m90331 156244 9280.1-22754 9429.4 10478z"
+         id="path21" />
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m90331 156242 18703-12266 12282 6129.8z"
+         id="path22" />
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m99611 133490 21406-3443-11977 13924z"
+         id="path23" />
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m121016 130047 14819 6885.9-26796 7035.2z"
+         id="path24" />
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m109042 143968 26792-7035.2-14517 13175z"
+         id="path25" />
+    </g>
+    <path
+       transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+       d="m30860 151253h10809v-10579h-10809z"
+       fill-opacity="0"
+       id="path26" />
+    <g
+       fill-opacity="0"
+       id="g32">
+      <g
+         stroke-linejoin="round"
+         stroke-miterlimit="8"
+         stroke-width="762"
+         id="g29">
+        <path
+           transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+           d="m140676 143149c0 15240-12354 27594-27594 27594-7318.4 0-14337-2907.2-19512-8082.1-5174.9-5174.9-8082.1-12194-8082.1-19512 0-15240 12354-27594 27594-27594 15240 0 27594 12354 27594 27594z"
+           stroke="#15c"
+           id="path27" />
+        <path
+           transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+           d="m98768 145404c0 7233.8-5864.2 13098-13098 13098-3473.8 0-6805.3-1380-9261.7-3836.3-2456.4-2456.3-3836.3-5787.9-3836.3-9261.7 0-7233.8 5864.2-13098 13098-13098 7233.8 0 13098 5864.2 13098 13098z"
+           stroke="#c00"
+           id="path28" />
+        <path
+           transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+           d="m80949 133159-36168 12540 40704 528z"
+           stroke="#000"
+           class="fg-stroke"
+           id="path29" />
+      </g>
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m61359 140138c193.17 456.54 913.22 1782.3 1159 2739.3 245.82 956.96 263.23 2502.1 315.88 3002.5"
+         stroke="#c00"
+         stroke-dasharray="381, 1143"
+         stroke-linejoin="round"
+         stroke-miterlimit="8"
+         stroke-width="381"
+         id="path30" />
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m77429 134299 3396-1140 1140 3396-3396 1140z"
+         stroke="#000"
+         stroke-linejoin="round"
+         stroke-miterlimit="8"
+         stroke-width="381"
+         class="fg-stroke"
+         id="path31" />
+      <path
+         transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+         d="m59364 142852h13272v14292h-13272z"
+         id="path32" />
+    </g>
+    <text
+       transform="matrix(1.0361 0 0 1.0361 168.84 926.14)"
+       xml:space="preserve"
+       id="text32"><tspan
+         x="0"
+         y="0"
+         fill="#000000"
+         font-family="'Artifakt Element'"
+         font-size="18.667px"
+         font-style="italic"
+         class="fg-fill"
+         id="tspan32">d</tspan></text>
+    <path
+       transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+       d="m75903 132772h13272v14292h-13272z"
+       fill-opacity="0"
+       id="path33" />
+    <text
+       transform="matrix(1.0361 0 0 1.0361 213.82 898.73)"
+       xml:space="preserve"
+       id="text33"><tspan
+         x="0"
+         y="0"
+         fill="#000000"
+         font-family="'Artifakt Element'"
+         font-size="18.667px"
+         font-style="italic"
+         class="fg-fill"
+         id="tspan33">e</tspan></text>
+    <text
+       transform="matrix(1.0361 0 0 1.0361 249.92 1002)"
+       xml:space="preserve"
+       id="text34"><tspan
+         x="0 12.431999 22.810665 33.189331 43.567997 53.946663 58.090664 68.46933 78.848 84.018661 93.351997 103.73066 114.10933 124.488 130.70399"
+         y="0"
+         fill="#1155cc"
+         font-family="'Artifakt Element'"
+         font-size="18.667px"
+         id="tspan34">Bounding sphere</tspan></text>
+    <path
+       transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+       d="m36055 159716h59892v16200h-59892z"
+       fill-opacity="0"
+       id="path34" />
+    <text
+       transform="matrix(1.0361 0 0 1.0361 120.63 972)"
+       xml:space="preserve"
+       id="text35"><tspan
+         x="0 14.504 24.882666 35.261333 45.639999 51.855999 55.999996 65.333328 70.503998 80.882668 87.098663 93.314667 103.69333"
+         y="0"
+         fill="#990000"
+         font-family="'Artifakt Element'"
+         font-size="18.667px"
+         id="tspan35">Quadric error</tspan></text>
+    <path
+       transform="matrix(.0027194 0 0 .0027194 -1.922 509.77)"
+       d="m84039 146220c0-808.54 655.45-1464 1464-1464 388.27 0 760.64 154.26 1035.2 428.8 274.56 274.55 428.8 646.92 428.8 1035.2 0 808.55-655.46 1464-1464 1464-808.55 0-1464-655.45-1464-1464z"
+       fill-rule="evenodd"
+       class="fg-fill"
+       id="path35" />
+  </g>
+  <path
+     transform="matrix(0.00260443,0,0,0.00260443,-473.11146,-338.83216)"
+     d="m 193755,165354 -4704,-3486 4704,-3486 z"
+     clip-path="url(#h-6)"
+     id="path292"
+     class="fg-fill" />
+  <path
+     transform="matrix(0.00260443,0,0,0.00260443,-473.11146,-338.83216)"
+     d="m 182174,159493 c 0,-656.14 531.89,-1188 1188,-1188 h 5963.9 c 315.09,0 617.26,125.17 840.06,347.97 222.8,222.8 347.97,524.97 347.97,840.06 v 4751.9 c 0,656.14 -531.89,1188 -1188,1188 h -5963.9 c -656.14,0 -1188,-531.89 -1188,-1188 z"
+     clip-path="url(#g-3)"
+     id="path293"
+     class="fg-fill" />
+</svg>
