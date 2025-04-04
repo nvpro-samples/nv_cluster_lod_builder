@@ -47,7 +47,7 @@ inline void storeAndAdvance(bool& isValid, uint64_t& dataAddress, uint64_t dataE
 {
   assert(static_cast<uint64_t>(dataAddress) % ALIGNMENT == 0);
 
-  if(isValid && view.size() && dataAddress + getCachedSize(view) <= dataEnd)
+  if(isValid && dataAddress + getCachedSize(view) <= dataEnd)
   {
     union
     {
@@ -61,13 +61,17 @@ inline void storeAndAdvance(bool& isValid, uint64_t& dataAddress, uint64_t dataE
     // store count first
     memcpy(reinterpret_cast<void*>(dataAddress), countData, ALIGNMENT);
     dataAddress += ALIGNMENT;
-    // then data
-    memcpy(reinterpret_cast<void*>(dataAddress), view.data(), view.size_bytes());
-    dataAddress += (view.size_bytes() + ALIGN_MASK) & ~ALIGN_MASK;
+
+    if(view.size())
+    {
+      // then data
+      memcpy(reinterpret_cast<void*>(dataAddress), view.data(), view.size_bytes());
+      dataAddress += (view.size_bytes() + ALIGN_MASK) & ~ALIGN_MASK;
+    }
   }
   else
   {
-    isValid = isValid && view.empty();
+    isValid = false;
   }
 }
 
@@ -402,10 +406,7 @@ class CacheView
 #endif
 
 public:
-  bool isValid() const
-  {
-    return m_dataSize != 0;
-  }
+  bool isValid() const { return m_dataSize != 0; }
 
   bool init(uint64_t dataSize, const void* data)
   {
@@ -439,15 +440,9 @@ public:
     return true;
   }
 
-  void deinit()
-  {
-    *(this) = {};
-  }
+  void deinit() { *(this) = {}; }
 
-  uint64_t getGeometryCount() const
-  {
-    return m_geometryCount;
-  }
+  uint64_t getGeometryCount() const { return m_geometryCount; }
 
   bool getLodGeometryView(LodGeometryView& view, uint64_t geometryIndex) const
   {
