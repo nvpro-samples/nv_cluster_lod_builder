@@ -17,6 +17,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Workaround for libc++ std::execution
+#include "../nv_cluster_builder/src/parallel_execution_libcxx.hpp"
+
 #include <array>
 #include <cstdint>
 #include <execution>
@@ -890,7 +893,7 @@ static nvclusterlod::Result decimateClusterGroups(DecimatedClusterGroups& curren
     std::vector<nvclusterlod::uvec3> decimatedTriangleVertices(clusterGroupTriangleVertices.size());
     constexpr float                  targetError   = std::numeric_limits<float>::max();
     float                            absoluteError = 0.0f;
-    int options = meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute;  // no meshopt_SimplifyLockBorder as we only care about vertices shared between cluster groups
+    unsigned int options = meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute;  // no meshopt_SimplifyLockBorder as we only care about vertices shared between cluster groups
     size_t desiredTriangleCount = size_t(float(clusterGroupTriangleVertices.size()) * lodLevelDecimationFactor);
     size_t simplifiedTriangleCount =
         meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),

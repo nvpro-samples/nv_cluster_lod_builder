@@ -17,6 +17,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Workaround for libc++ std::execution
+#include "../nv_cluster_builder/src/parallel_execution_libcxx.hpp"
+
 #include <execution>
 #include <span>
 #include <vector>

@@ -192,7 +192,11 @@ inline void parallel_batches(uint64_t numItems, F&& fn)
 
     // This runs the worker above for each batch from 0 to numBatches-1.
     iota_view<uint64_t> batches(0, numBatches);
+#if NVCLUSTERLOD_MULTITHREADED
     std::for_each(std::execution::par_unseq, batches.begin(), batches.end(), worker);
+#else
+    std::for_each(std::execution::seq, batches.begin(), batches.end(), worker);
+#endif
   }
 }
 
