@@ -19,56 +19,55 @@
 
 #pragma once
 
+#include <nvclusterlod/nvclusterlod_mesh.h>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include <nvclusterlod/nvclusterlod_mesh.h>
-
-
 namespace nvclusterlod {
-
 
 // Shortcut and storage for LOD output
 struct LodMesh
 {
-  void resize(const MeshRequirements& sizes)
+  template <class Counts>
+  void resize(const Counts& counts)
   {
-    triangleVertices.resize(sizes.maxTriangleCount * 3);
-    clusterTriangleRanges.resize(sizes.maxClusterCount);
-    clusterGeneratingGroups.resize(sizes.maxClusterCount);
-    clusterBoundingSpheres.resize(sizes.maxClusterCount);
-    groupQuadricErrors.resize(sizes.maxGroupCount);
-    groupClusterRanges.resize(sizes.maxGroupCount);
-    lodLevelGroupRanges.resize(sizes.maxLodLevelCount);
+    triangleVertices.resize(counts.triangleCount);
+    clusterTriangleRanges.resize(counts.clusterCount);
+    clusterGeneratingGroups.resize(counts.clusterCount);
+    clusterBoundingSpheres.resize(counts.clusterCount);
+    groupQuadricErrors.resize(counts.groupCount);
+    groupClusterRanges.resize(counts.groupCount);
+    lodLevelGroupRanges.resize(counts.lodLevelCount);
   }
 
-  std::vector<uint32_t>         triangleVertices;
-  std::vector<nvcluster::Range> clusterTriangleRanges;
-  std::vector<uint32_t>         clusterGeneratingGroups;
-  std::vector<Sphere>           clusterBoundingSpheres;
-  std::vector<float>            groupQuadricErrors;
-  std::vector<nvcluster::Range> groupClusterRanges;
-  std::vector<nvcluster::Range> lodLevelGroupRanges;
+  std::vector<nvclusterlod_Vec3u>  triangleVertices;
+  std::vector<nvcluster_Range>     clusterTriangleRanges;
+  std::vector<uint32_t>            clusterGeneratingGroups;
+  std::vector<nvclusterlod_Sphere> clusterBoundingSpheres;
+  std::vector<float>               groupQuadricErrors;
+  std::vector<nvcluster_Range>     groupClusterRanges;
+  std::vector<nvcluster_Range>     lodLevelGroupRanges;
 };
 
-
-inline nvclusterlod::Result generateLodMesh(nvclusterlod::Context context, const MeshInput& input, LodMesh& lodMesh)
+// LodMesh delayed init constructor
+inline nvclusterlod_Result generateLodMesh(nvclusterlod_Context context, const nvclusterlod_MeshInput& input, LodMesh& lodMesh)
 {
-  MeshGetRequirementsInfo reqInfo;
-  reqInfo.input = &input;
-
   // Get conservative output sizes
-  MeshRequirements sizes = nvclusterlodMeshGetRequirements(context, &reqInfo);
+  nvclusterlod_MeshCounts counts;
+  if(nvclusterlod_Result result = nvclusterlodGetMeshRequirements(context, &input, &counts); result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+  {
+    return result;
+  }
 
   // Allocate storage
-  lodMesh.resize(sizes);
+  lodMesh.resize(counts);
 
   // Make LODs
-  nvclusterlod::MeshOutput lodOutput{};
+  nvclusterlod_MeshOutput lodOutput{};
   lodOutput.clusterTriangleRanges   = lodMesh.clusterTriangleRanges.data();
-  lodOutput.clusterTriangles        = reinterpret_cast<uint32_t*>(lodMesh.triangleVertices.data());
+  lodOutput.triangleVertices        = lodMesh.triangleVertices.data();
   lodOutput.clusterGeneratingGroups = lodMesh.clusterGeneratingGroups.data();
   lodOutput.clusterBoundingSpheres  = lodMesh.clusterBoundingSpheres.data();
   lodOutput.groupQuadricErrors      = lodMesh.groupQuadricErrors.data();
@@ -79,33 +78,25 @@ inline nvclusterlod::Result generateLodMesh(nvclusterlod::Context context, const
   lodOutput.lodLevelCount           = uint32_t(lodMesh.lodLevelGroupRanges.size());
   lodOutput.triangleCount           = uint32_t(lodMesh.triangleVertices.size());
 
-  MeshCreateInfo createInfo;
-  createInfo.input = &input;
-
-  nvclusterlod::Result result = nvclusterlodMeshCreate(context, &createInfo, &lodOutput);
-
-  if(result != nvclusterlod::Result::SUCCESS)
+  if(nvclusterlod_Result result = nvclusterlodBuildMesh(context, &input, &lodOutput); result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
   {
-    lodOutput = {};
     return result;
   }
 
-  sizes.maxClusterCount  = lodOutput.clusterCount;
-  sizes.maxGroupCount    = lodOutput.groupCount;
-  sizes.maxLodLevelCount = lodOutput.lodLevelCount;
-  sizes.maxTriangleCount = lodOutput.triangleCount;
-
-  // Truncate to output size written
-  lodMesh.resize(sizes);
-  return nvclusterlod::Result::SUCCESS;
+  // Truncate the output to the size written
+  lodMesh.resize(lodOutput);
+  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
-
 
 struct LocalizedLodMesh
 {
   LodMesh                       lodMesh;  // contains cluster-local triangle indices
-  std::vector<nvcluster::Range> clusterVertexRanges;
+  std::vector<nvcluster_Range>  clusterVertexRanges;
   std::vector<uint32_t>         vertexGlobalIndices;
+
+  // Per-cluster maximums
+  uint32_t maxClusterTriangles = 0;
+  uint32_t maxClusterVertices  = 0;
 };
 
 // Computes unique triangle vertices per cluster, returning vertex ranges and
@@ -114,37 +105,32 @@ struct LocalizedLodMesh
 // TODO: parallelize?
 // TODO: LocalizedClusterVertices::vertexGlobalIndices indirection is transient
 //       and might better be handled as a callback
-inline nvclusterlod::Result generateLocalizedLodMesh(nvclusterlod::Context context, const MeshInput& input, LocalizedLodMesh& localizedMesh)
-
+inline nvclusterlod_Result generateLocalizedLodMesh(LodMesh&& input, LocalizedLodMesh& localizedMesh)
 {
-  nvclusterlod::Result result = generateLodMesh(context, input, localizedMesh.lodMesh);
-  if(result != nvclusterlod::Result::SUCCESS)
+  if(&localizedMesh.lodMesh != &input)
   {
-    return result;
+    localizedMesh.lodMesh = std::move(input);
   }
 
   for(size_t clusterTriangleRangeIndex = 0;
       clusterTriangleRangeIndex < localizedMesh.lodMesh.clusterTriangleRanges.size(); clusterTriangleRangeIndex++)
   {
-
-    const nvcluster::Range& clusterTriangleRange = localizedMesh.lodMesh.clusterTriangleRanges[clusterTriangleRangeIndex];
-
-    // FIXME: the indices are changed from global to cluster-local in-place, this needs to be made clear in the doc
-    std::span<const uint32_t> globalTriangles(localizedMesh.lodMesh.triangleVertices.data() + 3 * clusterTriangleRange.offset,
-                                              clusterTriangleRange.count * 3);
-    std::span<uint32_t> localTriangles(localizedMesh.lodMesh.triangleVertices.data() + 3 * clusterTriangleRange.offset,
-                                       clusterTriangleRange.count * 3);
+    const nvcluster_Range& clusterTriangleRange = localizedMesh.lodMesh.clusterTriangleRanges[clusterTriangleRangeIndex];
+    std::span<const nvclusterlod_Vec3u> globalTriangles(
+        localizedMesh.lodMesh.triangleVertices.data() + clusterTriangleRange.offset, clusterTriangleRange.count);
+    std::span<nvclusterlod_Vec3u> localTriangles(localizedMesh.lodMesh.triangleVertices.data() + clusterTriangleRange.offset,
+                                                 clusterTriangleRange.count);
 
     uint32_t currentLocalTriangleIndex = 0;
 
-    nvcluster::Range vertexRange{.offset = uint32_t(localizedMesh.vertexGlobalIndices.size()), .count = 0};
+    nvcluster_Range vertexRange{.offset = uint32_t(localizedMesh.vertexGlobalIndices.size()), .count = 0};
 
     {
       std::unordered_map<uint32_t, uint32_t> vertexCache;
-      for(size_t globalTriangleIndex = 0; globalTriangleIndex < globalTriangles.size() / 3; globalTriangleIndex++)
+      for(size_t globalTriangleIndex = 0; globalTriangleIndex < globalTriangles.size(); globalTriangleIndex++)
       {
-        const uint32_t* inputTriangle  = &globalTriangles[3 * globalTriangleIndex];
-        uint32_t*       outputTriangle = &localTriangles[3 * currentLocalTriangleIndex];
+        const auto& inputTriangle  = reinterpret_cast<const uint32_t(&)[3]>(globalTriangles[globalTriangleIndex]);
+        auto&       outputTriangle = reinterpret_cast<uint32_t(&)[3]>(localTriangles[currentLocalTriangleIndex]);
         currentLocalTriangleIndex++;
         for(int j = 0; j < 3; ++j)
         {
@@ -155,17 +141,25 @@ inline nvclusterlod::Result generateLocalizedLodMesh(nvclusterlod::Context conte
             localizedMesh.vertexGlobalIndices.push_back(inputTriangle[j]);
           }
           outputTriangle[j] = vertIndexIt->second;
-          if(outputTriangle[j] >= 256)
-          {
-            return nvclusterlod::Result::ERROR_OUTPUT_MESH_OVERFLOW;
-          }
         }
       }
       vertexRange.count = uint32_t(vertexCache.size());
     }
     localizedMesh.clusterVertexRanges.push_back(vertexRange);
+    localizedMesh.maxClusterTriangles = std::max(localizedMesh.maxClusterTriangles, clusterTriangleRange.count);
+    localizedMesh.maxClusterVertices  = std::max(localizedMesh.maxClusterVertices, vertexRange.count);
   }
-  return nvclusterlod::Result::SUCCESS;
+  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+}
+
+inline nvclusterlod_Result generateLocalizedLodMesh(nvclusterlod_Context context, const nvclusterlod_MeshInput& input, LocalizedLodMesh& localizedMesh)
+{
+  LodMesh lodMesh;
+  if(nvclusterlod_Result result = generateLodMesh(context, input, lodMesh); result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+  {
+    return result;
+  }
+  return generateLocalizedLodMesh(std::move(lodMesh), localizedMesh);
 }
 
 
@@ -174,7 +168,7 @@ inline nvclusterlod::Result generateLocalizedLodMesh(nvclusterlod::Context conte
 // clusterGeneratingGroups for each groupClusterRanges.
 struct GroupGeneratingGroups
 {
-  std::vector<nvcluster::Range> ranges;  // ranges of groups
+  std::vector<nvcluster_Range>  ranges;  // ranges of groups
   std::vector<uint32_t>         groups;  // indices of generating groups
 
   // Accessors to view this struct as an array of arrays. This avoids having the
@@ -187,9 +181,9 @@ struct GroupGeneratingGroups
 };
 
 
-inline nvclusterlod::Result generateGroupGeneratingGroups(std::span<const nvcluster::Range>    groupClusterRanges,
-                                                          std::span<const uint32_t>            clusterGeneratingGroups,
-                                                          nvclusterlod::GroupGeneratingGroups& groupGeneratingGroups)
+inline nvclusterlod_Result generateGroupGeneratingGroups(std::span<const nvcluster_Range>     groupClusterRanges,
+                                                         std::span<const uint32_t>            clusterGeneratingGroups,
+                                                         nvclusterlod::GroupGeneratingGroups& groupGeneratingGroups)
 {
   groupGeneratingGroups.ranges.reserve(groupClusterRanges.size());
 
@@ -202,22 +196,22 @@ inline nvclusterlod::Result generateGroupGeneratingGroups(std::span<const nvclus
 
   for(size_t groupIndex = 0; groupIndex < groupClusterRanges.size(); groupIndex++)
   {
-    const nvcluster::Range& clusterRange = groupClusterRanges[groupIndex];
+    const nvcluster_Range& clusterRange = groupClusterRanges[groupIndex];
     if(clusterRange.count == 0)
     {
-      return nvclusterlod::Result::ERROR_EMPTY_CLUSTER_GENERATING_GROUPS;
+      return nvclusterlod_Result::NVCLUSTERLOD_ERROR_EMPTY_CLUSTER_GENERATING_GROUPS;
     }
 
     std::span<const uint32_t> generatingGroups(clusterGeneratingGroups.data() + clusterRange.offset, clusterRange.count);
 
-    if(generatingGroups[0] == ORIGINAL_MESH_GROUP)
+    if(generatingGroups[0] == NVCLUSTERLOD_ORIGINAL_MESH_GROUP)
     {
       groupGeneratingGroups.ranges.push_back({offset, 0});  // LOD0 groups have no generating group
     }
     else
     {
       std::unordered_set uniqueGeneratingGroups(generatingGroups.begin(), generatingGroups.end());
-      nvcluster::Range   newGroupRange = {offset, uint32_t(uniqueGeneratingGroups.size())};
+      nvcluster_Range    newGroupRange = {offset, uint32_t(uniqueGeneratingGroups.size())};
       groupGeneratingGroups.ranges.push_back(newGroupRange);
       groupGeneratingGroups.groups.insert(groupGeneratingGroups.groups.end(), uniqueGeneratingGroups.begin(),
                                           uniqueGeneratingGroups.end());
@@ -225,6 +219,6 @@ inline nvclusterlod::Result generateGroupGeneratingGroups(std::span<const nvclus
       offset += newGroupRange.count;
     }
   }
-  return nvclusterlod::Result::SUCCESS;
+  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
 }  // namespace nvclusterlod

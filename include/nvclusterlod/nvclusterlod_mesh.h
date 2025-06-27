@@ -16,150 +16,161 @@
  * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION
  * SPDX-License-Identifier: Apache-2.0
  */
+#ifndef NVCLUSTERLOD_MESH_H
+#define NVCLUSTERLOD_MESH_H
 
-#pragma once
+#include <nvcluster/nvcluster.h>
+#include <nvclusterlod/nvclusterlod_common.h>
+#include <stdint.h>
 
-#include <cstdint>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#include "nvcluster/nvcluster.h"
-#include "nvclusterlod_common.h"
+// LODs are formed from a directed acyclic graph of groups of clusters of
+// triangles. Each group has a generating group index. This value is a special
+// index indicating this group has no generating group, i.e. it is a cluster
+// group formed from original mesh triangles.
+#define NVCLUSTERLOD_ORIGINAL_MESH_GROUP (~0u)
 
+#define nvclusterlod_defaultClusterConfig()                                                                                 \
+  {                                                                                                                         \
+    .minClusterSize = 96, .maxClusterSize = 128, .costUnderfill = 0.9f, .costOverlap = 0.5f, .preSplitThreshold = 1u << 17, \
+  }
 
-namespace nvclusterlod {
+#define nvclusterlod_defaultGroupConfig()                                                                              \
+  {                                                                                                                    \
+    .minClusterSize = 24, .maxClusterSize = 32, .costUnderfill = 0.5f, .costOverlap = 0.0f, .preSplitThreshold = 0,    \
+  }
 
-// Each level of detail is represented by a group of clusters. This value identifies the original group, corresponding to the entire input mesh
-const uint32_t ORIGINAL_MESH_GROUP = ~0u;
-
-// High density mesh and clustering parameters used to generate the LODs for the mesh
-struct MeshInput
+// Input mesh and clustering parameters used to generate decimated LODs.
+typedef struct nvclusterlod_MeshInput
 {
-  // Pointer to triangle definitions, 3 indices per triangle
-  const uint32_t* indices = nullptr;
-  // Number of indices in the mesh
-  uint32_t indexCount = 0u;
+  // Array of triangles. Each indexes 3 vertices.
+  const nvclusterlod_Vec3u* triangleVertices NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Vertex data for the mesh, 3 floats per entry
-  const float* vertices = nullptr;
-  // Offset in vertices where the vertex data for the mesh starts, in float
-  uint32_t vertexOffset = 0u;
-  // Number of vertices in the mesh
-  uint32_t vertexCount = 0u;
-  // Stride in bytes between the beginning of two successive vertices (e.g. 12 bytes for densely packed positions)
-  uint32_t vertexStride = 0u;
+  // Number of triangles in triangleVertices
+  uint32_t triangleCount NVCLUSTERLOD_DEFAULT(0u);
+
+  // Pointer to the first vertex position
+  const nvcluster_Vec3f* vertexPositions NVCLUSTERLOD_DEFAULT(nullptr);
+
+  // Maximum vertex (plus one) referenced by triangleVertices
+  uint32_t vertexCount NVCLUSTERLOD_DEFAULT(0u);
+
+  // Stride in bytes between successive vertices (e.g. 12 bytes for tightly
+  // packed positions)
+  uint32_t vertexStride NVCLUSTERLOD_DEFAULT(sizeof(nvcluster_Vec3f));
 
   // Configuration for the generation of triangle clusters
-  nvcluster::Config clusterConfig = {
-      .minClusterSize    = 96,
-      .maxClusterSize    = 128,
-      .costUnderfill     = 0.9f,
-      .costOverlap       = 0.5f,
-      .preSplitThreshold = 1u << 17,
-  };
+  nvcluster_Config clusterConfig NVCLUSTERLOD_DEFAULT(nvclusterlod_defaultClusterConfig());
 
   // Configuration for the generation of cluster groups
   // Each LOD is comprised of a number of cluster groups
-  nvcluster::Config groupConfig = {
-      .minClusterSize    = 24,
-      .maxClusterSize    = 32,
-      .costUnderfill     = 0.5f,
-      .costOverlap       = 0.0f,
-      .preSplitThreshold = 0,
-  };
+  nvcluster_Config groupConfig NVCLUSTERLOD_DEFAULT(nvclusterlod_defaultGroupConfig());
 
   // Decimation factor applied between successive LODs
-  float decimationFactor = 0.f;
-};
+  float decimationFactor NVCLUSTERLOD_DEFAULT(0.0f);
+} nvclusterlod_MeshInput;
 
-// Memory requirements for the storage of the entirety of the mesh, including its LODs
-struct MeshRequirements
+// Memory requirements for the output storage of the mesh LODs
+typedef struct nvclusterlod_MeshCounts
 {
   // Maximum total number of triangles across LODs
-  uint32_t maxTriangleCount = 0u;
+  uint32_t triangleCount NVCLUSTERLOD_DEFAULT(0u);
+
   // Maximum total number of clusters across LODs
-  uint32_t maxClusterCount = 0u;
+  uint32_t clusterCount NVCLUSTERLOD_DEFAULT(0u);
+
   // Maximum total number of cluster groups across LODs
-  uint32_t maxGroupCount = 0u;
+  uint32_t groupCount NVCLUSTERLOD_DEFAULT(0u);
+
   // Maximum number of LODs in the mesh
-  uint32_t maxLodLevelCount = 0u;
-};
+  uint32_t lodLevelCount NVCLUSTERLOD_DEFAULT(0u);
+} nvclusterlod_MeshCounts;
 
-struct MeshOutput
+// Pointers to output clusters referencing original vertices and counts written.
+// Continuous LOD can be created by stitching together clusters from various
+// LODs. Bounding spheres and errors must first be updated to propagate their
+// values between LODs. This is currently performed by the spatial hierarchy
+// API, but could be done separately. These values may be passed directly to
+// nvclusterlod_HierarchyInput.
+typedef struct nvclusterlod_MeshOutput
 {
-  // Triangle clusters. Each Range represents one cluster covering range.count triangles in clusterTriangles, starting at range.offset
-  nvcluster::Range* clusterTriangleRanges = nullptr;
+  // Clusters of triangles. This is the granularity at which geometry can be
+  // swapped in and out for detail selection. Each range selects a subset of
+  // the triangleVertices array.
+  nvcluster_Range* clusterTriangleRanges NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Triangle data for the clusters, referenced by clusterTriangleRanges
-  uint32_t* clusterTriangles = nullptr;
+  // New triangles for all LODs. These are produced by iterative decimation of
+  // the original input mesh and reference vertices in the original.
+  nvclusterlod_Vec3u* triangleVertices NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Decimation takes the mesh at a given LOD represented by a number of cluster groups,
-  // and generates a (smaller) number of cluster groups for the next coarser LOD. For each
-  // generated cluster clusterGeneratingGroups stores the index of the group it was generated from.
-  // For the clusters at the finest LOD (LOD 0) that index is ORIGINAL_MESH_GROUP
-  uint32_t* clusterGeneratingGroups = nullptr;
+  // The group of clusters that was decimated to produce the geometry in each
+  // cluster, or NVCLUSTERLOD_ORIGINAL_MESH_GROUP if the cluster is original
+  // mesh geometry. This relationship forms a DAG. Levels of detail are
+  // generated by iteratively decimating groups of clusters and re-clustering
+  // the result. The clusters in a group will have mixed generating groups. See
+  // the readme for a visuzliation.
+  uint32_t* clusterGeneratingGroups NVCLUSTERLOD_DEFAULT(nullptr);
 
   // Bounding spheres of the clusters, may be nullptr
-  Sphere* clusterBoundingSpheres = nullptr;
+  // TODO: verify 'may be nullptr' - likely doesn't work anymore
+  nvclusterlod_Sphere* clusterBoundingSpheres NVCLUSTERLOD_DEFAULT(nullptr);
 
   // Error metric after decimating geometry in each group. Counter-intuitively,
   // not the error of the geometry in the group - that value does not exist
-  // per-group but would be the group quadric error of the cluster's generating
-  // group. This saves duplicating errors per cluster. The final LOD is just one
-  // group, is not decimated, and has an error of zero.
+  // per-group. For the current level, use
+  // groupQuadricErrors[clusterGeneratingGroups[cluster]]. This saves
+  // duplicating data per cluster. The final LOD (just one
+  // group) is not decimated and has an error of zero.
   // TODO: shouldn't this be infinite error so it's always drawn?
-  float* groupQuadricErrors = nullptr;
+  float* groupQuadricErrors NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Ranges of clusters contained in each group so that the clusters of a group are stored at range.offset in clusterTriangleRanges
-  // and the group covers range.count clusters.
-  nvcluster::Range* groupClusterRanges = nullptr;
+  // Ranges of clusters for each group of clusters. I.e. cluster values for a
+  // group are stored at cluster*[range.offset + i] for i in {0 .. range.count -
+  // 1}.
+  nvcluster_Range* groupClusterRanges NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Ranges of groups comprised in each LOD level, so that the groups for LOD n are stored at lodLevelGroupRanges[n].offset and the LOD
-  // uses lodLevelGroupRanges[n].count groups. The finest LOD is at index 0, followed by the coarser LODs from finer to coarser
-  nvcluster::Range* lodLevelGroupRanges = nullptr;
+  // Ranges of groups for each LOD level. I.e. group values for a LOD are stored
+  // at group*[range.offset + i] for i in {0 .. range.count - 1}. The finest LOD
+  // is at index 0 (comprised of clusters of the original mesh), followed by the
+  // coarser LODs from finer to coarser.
+  nvcluster_Range* lodLevelGroupRanges NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Number of triangles in the mesh across LODs
-  uint32_t triangleCount = 0u;
-  // Number of clusters in the mesh across LODs
-  uint32_t clusterCount = 0u;
-  // Number of cluster groups in the mesh across LODs
-  uint32_t groupCount = 0u;
-  // Number of LODs in the mesh
-  uint32_t lodLevelCount = 0u;
-};
+  // Number of triangles for all LODs
+  uint32_t triangleCount NVCLUSTERLOD_DEFAULT(0u);
 
-// Structure to request the memory requirements to build the LODs for the input mesh
-struct MeshGetRequirementsInfo
-{
-  // Definition of the input geometry and clustering configuration
-  const MeshInput* input = nullptr;
-};
+  // Number of clusters for all LODs
+  uint32_t clusterCount NVCLUSTERLOD_DEFAULT(0u);
 
-// Structure to build the LODs for the input mesh
-struct MeshCreateInfo
-{
-  // Definition of the input geometry and clustering configuration
-  const MeshInput* input = nullptr;
-};
+  // Number of cluster groups for all LODs
+  uint32_t groupCount NVCLUSTERLOD_DEFAULT(0u);
 
-}  // namespace nvclusterlod
-
-extern "C" {
+  // Number of LOD levels
+  uint32_t lodLevelCount NVCLUSTERLOD_DEFAULT(0u);
+} nvclusterlod_MeshOutput;
 
 // Usage:
-// 1. call nvlodMeshGetRequirements(...) to get conservative sizes
-// 2. allocate Output data
-// 3. call nvlodMeshCreate(...)
+// 1. call nvclusterlodMeshGetRequirements(...) to get conservative sizes
+// 2. allocate nvclusterlod_MeshOutput data
+// 3. call nvclusterlodMeshBuild(...)
 // 4. resize down to what was written
-// Alternatively use nvlod::LodMesh, which encapsulates the above
-// Note that returned vertices are global indices. The utility
-// nvlod::LocalizedLodMesh can be used to create vertex indices local
-// to each cluster.
+// Alternatively use nvclusterlod::LodMesh, which encapsulates the above Note
+// that returned vertices are global indices. The utility
+// nvclusterlod::LocalizedLodMesh can be used to create vertex indices local to
+// each cluster.
 
 // Request the memory requirements to build the LODs for the input mesh
-nvclusterlod::MeshRequirements nvclusterlodMeshGetRequirements(nvclusterlod::Context                        context,
-                                                               const nvclusterlod::MeshGetRequirementsInfo* info);
+nvclusterlod_Result nvclusterlodGetMeshRequirements(nvclusterlod_Context          context,
+                                                    const nvclusterlod_MeshInput* input,
+                                                    nvclusterlod_MeshCounts*      outputRequiredCounts);
 
 // Build the LODs for the input mesh
-nvclusterlod::Result nvclusterlodMeshCreate(nvclusterlod::Context               context,
-                                            const nvclusterlod::MeshCreateInfo* info,
-                                            nvclusterlod::MeshOutput*           output);
-}
+nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nvclusterlod_MeshInput* input, nvclusterlod_MeshOutput* output);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+#endif  // NVCLUSTERLOD_MESH_H

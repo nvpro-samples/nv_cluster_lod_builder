@@ -22,6 +22,8 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <limits>
+#include <nvclusterlod/nvclusterlod_cache.hpp>
+#include <nvclusterlod/nvclusterlod_common.h>
 #include <nvclusterlod/nvclusterlod_hierarchy.h>
 #include <nvclusterlod/nvclusterlod_hierarchy_storage.hpp>
 #include <nvclusterlod/nvclusterlod_mesh.h>
@@ -40,9 +42,9 @@ using uvec3 = std::array<uint32_t, 3>;
 using vec3  = std::array<float, 3>;
 using vec4  = std::array<float, 4>;
 
-vec3 getSpherePosition(const nvclusterlod::Sphere& sphere)
+vec3 getSpherePosition(const nvclusterlod_Sphere& sphere)
 {
-  return vec3{sphere.x, sphere.y, sphere.z};
+  return vec3{sphere.center.x, sphere.center.y, sphere.center.z};
 }
 
 // Adds two vec3s.
@@ -127,7 +129,7 @@ vec3 transformPoint(const mat4& t, const vec3& point)
 // Random number generator.
 std::default_random_engine rng(123);
 // Returns a uniform random point on a sphere.
-vec3 randomPointOnSphere(const nvclusterlod::Sphere& sphere)
+vec3 randomPointOnSphere(const nvclusterlod_Sphere& sphere)
 {
   // From https://www.pbr-book.org/4ed/Sampling_Algorithms/Sampling_Multidimensional_Functions#UniformlySamplingHemispheresandSpheres
 
@@ -200,17 +202,15 @@ void makeIcosphere(int depth, triangle_callback& callback)
 }
 
 // Writes the geometry part of the Wavefront .obj format to a stream.
-void writeObjGeometry(std::ostream& os, const uvec3* triangles, const size_t numTriangles, const vec3* positions, const size_t numPositions)
+void writeObjGeometry(std::ostream& os, std::span<const uvec3> triangles, std::span<const vec3> positions)
 {
-  for(size_t i = 0; i < numPositions; i++)
+  for(auto& p : positions)
   {
-    const vec3& p = positions[i];
     os << "v " << p[0] << " " << p[1] << " " << p[2] << "\n";
   }
 
-  for(size_t i = 0; i < numTriangles; i++)
+  for(auto& t : triangles)
   {
-    const uvec3& t = triangles[i];
     os << "f " << t[0] + 1 << " " << t[1] + 1 << " " << t[2] + 1 << "\n";
   }
 }
@@ -223,7 +223,7 @@ struct GeometryMesh
   {
     std::ofstream f(path);
     f << "g mesh\n";
-    writeObjGeometry(f, triangles.data(), triangles.size(), positions.data(), positions.size());
+    writeObjGeometry(f, triangles, positions);
   }
 };
 
@@ -252,7 +252,7 @@ GeometryMesh makeIcosphere(int subdivision)
 
 // Computes the conservative maximum arcsine of any geometric error relative to
 // the camera, where 'transform' defines a transformation to eye-space.
-float conservativeErrorOverDistance(const mat4& transform, const nvclusterlod::Sphere& boundingSphere, float objectSpaceQuadricError)
+float conservativeErrorOverDistance(const mat4& transform, const nvclusterlod_Sphere& boundingSphere, float objectSpaceQuadricError)
 {
   float radiusScale    = 1.0f;
   float maxError       = objectSpaceQuadricError * radiusScale;
@@ -261,28 +261,28 @@ float conservativeErrorOverDistance(const mat4& transform, const nvclusterlod::S
   return maxError / errorDistance;
 }
 
-bool traverseChild(const mat4& viewInstanceTransform, const nvclusterlod::Node& node, float errorOverDistanceThreshold)
+bool traverseChild(const mat4& viewInstanceTransform, const nvclusterlod_HierarchyNode& node, float errorOverDistanceThreshold)
 {
   return conservativeErrorOverDistance(viewInstanceTransform, node.boundingSphere, node.maxClusterQuadricError) >= errorOverDistanceThreshold;
 }
 
-bool renderCluster(const mat4& viewInstanceTransform, float quadricError, const nvclusterlod::Sphere& boundingSphere, float errorOverDistanceThreshold)
+bool renderCluster(const mat4& viewInstanceTransform, float quadricError, const nvclusterlod_Sphere& boundingSphere, float errorOverDistanceThreshold)
 {
   return conservativeErrorOverDistance(viewInstanceTransform, boundingSphere, quadricError) < errorOverDistanceThreshold;
 }
 
-bool traverseChild(const vec3& cameraPosition, const nvclusterlod::Node& node, float errorOverDistanceThreshold)
+bool traverseChild(const vec3& cameraPosition, const nvclusterlod_HierarchyNode& node, float errorOverDistanceThreshold)
 {
   return traverseChild(mat4::makeTranslation(mul(cameraPosition, -1.f)), node, errorOverDistanceThreshold);
 }
 
-bool renderCluster(const vec3& cameraPosition, float quadricError, const nvclusterlod::Sphere& boundingSphere, float errorOverDistanceThreshold)
+bool renderCluster(const vec3& cameraPosition, float quadricError, const nvclusterlod_Sphere& boundingSphere, float errorOverDistanceThreshold)
 {
   return renderCluster(mat4::makeTranslation(mul(cameraPosition, -1.f)), quadricError, boundingSphere, errorOverDistanceThreshold);
 }
 
 // Returns whether `inner` is inside or equal to `outer`.
-bool isInside(const nvclusterlod::Sphere& inner, const nvclusterlod::Sphere& outer)
+bool isInside(const nvclusterlod_Sphere& inner, const nvclusterlod_Sphere& outer)
 {
   const float radiusDifference = outer.radius - inner.radius;
   return (radiusDifference >= 0.0f)  // if this is negative then `inner` cannot be inside `outer`
@@ -294,17 +294,17 @@ bool isInside(const nvclusterlod::Sphere& inner, const nvclusterlod::Sphere& out
 //   the node's bounding sphere.
 // - if it is an internal node, each child's bounding sphere is contained
 //   within the node's bounding sphere.
-void verifyNodeRecursive(const nvclusterlod::LocalizedLodMesh& m, const nvclusterlod::LodHierarchy& h, const nvclusterlod::Node& node)
+void verifyNodeRecursive(const nvclusterlod::LocalizedLodMesh& m, const nvclusterlod::LodHierarchy& h, const nvclusterlod_HierarchyNode& node)
 {
-  if(node.clusters.isLeafNode)
+  if(node.clusterGroup.isClusterGroup)
   {
     // Verify real cluster bounding spheres
     // TODO: cluster bounding spheres in hierarchy are not bounding spheres of
     // the cluster, but bounding spheres of the cluster's generating group.
-    const nvcluster::Range& clusterRange = m.lodMesh.groupClusterRanges[node.clusters.group];
+    const nvcluster_Range& clusterRange = m.lodMesh.groupClusterRanges[node.clusterGroup.group];
     for(uint32_t i = 0; i < clusterRange.count; i++)
     {
-      const nvclusterlod::Sphere& clusterSphere = m.lodMesh.clusterBoundingSpheres[clusterRange.offset + i];
+      const nvclusterlod_Sphere& clusterSphere = m.lodMesh.clusterBoundingSpheres[clusterRange.offset + i];
 #if 0  // For debugging
           printf("A = Sphere((%f, %f, %f), %f)\n", node.boundingSphere.x, node.boundingSphere.y, node.boundingSphere.z, node.boundingSphere.radius);
           printf("B = Sphere((%f, %f, %f), %f)\n", clusterSphere.x, clusterSphere.y, clusterSphere.z, clusterSphere.radius);
@@ -317,7 +317,7 @@ void verifyNodeRecursive(const nvclusterlod::LocalizedLodMesh& m, const nvcluste
   {
     for(uint32_t i = 0; i <= node.children.childCountMinusOne; i++)
     {
-      const nvclusterlod::Node& child = h.nodes[node.children.childOffset + i];
+      const nvclusterlod_HierarchyNode& child = h.nodes[node.children.childOffset + i];
       assert(isInside(child.boundingSphere, node.boundingSphere));
       EXPECT_TRUE(isInside(child.boundingSphere, node.boundingSphere));
       verifyNodeRecursive(m, h, child);
@@ -325,14 +325,14 @@ void verifyNodeRecursive(const nvclusterlod::LocalizedLodMesh& m, const nvcluste
   }
 }
 
-inline nvclusterlod::Sphere generatingSphere(std::span<const nvclusterlod::Sphere> groupSpheres, uint32_t generatingGroupIndex)
+inline nvclusterlod_Sphere generatingSphere(std::span<const nvclusterlod_Sphere> groupSpheres, uint32_t generatingGroupIndex)
 {
-  return (generatingGroupIndex == nvclusterlod::ORIGINAL_MESH_GROUP) ? nvclusterlod::Sphere{} : groupSpheres[generatingGroupIndex];
+  return (generatingGroupIndex == NVCLUSTERLOD_ORIGINAL_MESH_GROUP) ? nvclusterlod_Sphere{} : groupSpheres[generatingGroupIndex];
 }
 
 inline float generatingError(std::span<const float> groupErrors, uint32_t generatingGroupIndex)
 {
-  return (generatingGroupIndex == nvclusterlod::ORIGINAL_MESH_GROUP) ? 0.0f : groupErrors[generatingGroupIndex];
+  return (generatingGroupIndex == NVCLUSTERLOD_ORIGINAL_MESH_GROUP) ? 0.0f : groupErrors[generatingGroupIndex];
 }
 
 // Checks that there can be no overlapping geometry given two clusters from
@@ -340,13 +340,13 @@ inline float generatingError(std::span<const float> groupErrors, uint32_t genera
 void verifyMutuallyExclusive(const nvclusterlod::LocalizedLodMesh& m,
                              const nvclusterlod::LodHierarchy&     h,
                              uint32_t                              cluster0,
-                             const nvclusterlod::Node&             node0,
+                             const nvclusterlod_HierarchyNode&     node0,
                              uint32_t                              cluster1,
-                             const nvclusterlod::Node&             node1)
+                             const nvclusterlod_HierarchyNode&     node1)
 {
-  const nvclusterlod::Sphere cluster0Sphere =
+  const nvclusterlod_Sphere cluster0Sphere =
       generatingSphere(h.groupCumulativeBoundingSpheres, m.lodMesh.clusterGeneratingGroups[cluster0]);
-  const nvclusterlod::Sphere cluster1Sphere =
+  const nvclusterlod_Sphere cluster1Sphere =
       generatingSphere(h.groupCumulativeBoundingSpheres, m.lodMesh.clusterGeneratingGroups[cluster1]);
   const float cluster0QuadricError = generatingError(h.groupCumulativeQuadricError, m.lodMesh.clusterGeneratingGroups[cluster0]);
   const float cluster1QuadricError = generatingError(h.groupCumulativeQuadricError, m.lodMesh.clusterGeneratingGroups[cluster1]);
@@ -369,43 +369,43 @@ void verifyMutuallyExclusive(const nvclusterlod::LocalizedLodMesh& m,
 void writeDebugLodMesh(const std::string& filename, const GeometryMesh& mesh, const nvclusterlod::LodMesh& lodMesh)
 {
   std::ofstream f(filename);
-  writeObjGeometry(f, nullptr, 0, mesh.positions.data(), mesh.positions.size());
+  writeObjGeometry(f, {}, mesh.positions);
   for(size_t clusterIndex = 0; clusterIndex < lodMesh.clusterTriangleRanges.size(); ++clusterIndex)
   {
     f << "o cluster" << clusterIndex << "\n";
     f << "g cluster" << clusterIndex << "\n";
-    const nvcluster::Range& triangleRange = lodMesh.clusterTriangleRanges[clusterIndex];
+    const nvcluster_Range& triangleRange = lodMesh.clusterTriangleRanges[clusterIndex];
     const uvec3* pTriangleVertices = reinterpret_cast<const uvec3*>(lodMesh.triangleVertices.data()) + triangleRange.offset;
-    writeObjGeometry(f, pTriangleVertices, triangleRange.count, nullptr, 0);
+    writeObjGeometry(f, {pTriangleVertices, triangleRange.count}, {});
   }
 }
 
-// This nvcluster::Context cleans itself up so that we don't leak memory if
+// This nvcluster_Context cleans itself up so that we don't leak memory if
 // a test exits early.
 struct ScopedContext
 {
-  nvcluster::Context context = nullptr;
+  nvcluster_Context context = nullptr;
 
-  nvcluster::Result init()
+  nvcluster_Result init()
   {
     assert(!context);
-    nvcluster::ContextCreateInfo info{};
+    nvcluster_ContextCreateInfo info{};
     return nvclusterCreateContext(&info, &context);
   }
 
   ~ScopedContext() { std::ignore = nvclusterDestroyContext(context); }
 };
 
-// This nvclusterlod::Context cleans itself up so that we don't leak memory if
+// This nvclusterlod_Context cleans itself up so that we don't leak memory if
 // a test exits early.
 struct ScopedLodContext
 {
-  nvclusterlod::Context context = nullptr;
+  nvclusterlod_Context context = nullptr;
 
-  nvclusterlod::Result init(nvcluster::Context baseContext)
+  nvclusterlod_Result init(nvcluster_Context baseContext)
   {
     assert(!context);
-    nvclusterlod::ContextCreateInfo info{.clusterContext = baseContext};
+    nvclusterlod_ContextCreateInfo info{.clusterContext = baseContext};
     return nvclusterlodCreateContext(&info, &context);
   }
 
@@ -415,62 +415,59 @@ struct ScopedLodContext
 
 // GoogleTest does not offer any nice way to share data between tests. Since the
 // test data takes some time to generate, everything is just in one giant test.
-TEST(HierarchyTest, Everything)
+TEST(Hierarchy, BoundsAndOverlaps)
 {
   ScopedContext context;
-  ASSERT_EQ(context.init(), nvclusterlod::Result::SUCCESS);
+  ASSERT_EQ(context.init(), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
   ScopedLodContext lodContext;
-  ASSERT_EQ(lodContext.init(context.context), nvclusterlod::Result::SUCCESS);
+  ASSERT_EQ(lodContext.init(context.context), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
 
-  GeometryMesh            icosphere{makeIcosphere(6)};
-  nvclusterlod::MeshInput meshInput{
-      // Mesh data
-      .indices      = reinterpret_cast<const uint32_t*>(icosphere.triangles.data()),
-      .indexCount   = static_cast<uint32_t>(3 * icosphere.triangles.size()),
-      .vertices     = reinterpret_cast<const float*>(icosphere.positions.data()),
-      .vertexOffset = 0u,
-      .vertexCount  = static_cast<uint32_t>(icosphere.positions.size()),
-      .vertexStride = sizeof(vec3),
-      // Cluster configuration -- here we force clusters of size 32:
+  GeometryMesh           icosphere{makeIcosphere(6)};
+  nvclusterlod_MeshInput meshInput{
+      .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
+      .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
+      .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
+      .vertexCount      = static_cast<uint32_t>(icosphere.positions.size()),
+      .vertexStride     = sizeof(vec3),
       .clusterConfig =
           {
-              .minClusterSize    = 32,
+              .minClusterSize    = 32,  // force clusters of 32 triangles
               .maxClusterSize    = 32,
               .costUnderfill     = 0.9f,
               .costOverlap       = 0.5f,
               .preSplitThreshold = 1u << 17,
           },
-      // Cluster group configuration -- here we force groups of size 32:
       .groupConfig =
           {
-              .minClusterSize    = 32,
+              .minClusterSize    = 32,  // force groups of 32 clusters
               .maxClusterSize    = 32,
               .costUnderfill     = 0.5f,
               .costOverlap       = 0.0f,
               .preSplitThreshold = 0,
           },
-      // Decimation factor
       .decimationFactor = 0.5f,
   };
 
   nvclusterlod::LocalizedLodMesh mesh;
-  nvclusterlod::Result           result = nvclusterlod::generateLocalizedLodMesh(lodContext.context, meshInput, mesh);
-  ASSERT_EQ(result, nvclusterlod::Result::SUCCESS);
+  nvclusterlod_Result            result = nvclusterlod::generateLocalizedLodMesh(lodContext.context, meshInput, mesh);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+  EXPECT_EQ(mesh.maxClusterTriangles, 32);
+  EXPECT_GE(mesh.maxClusterVertices, 32 / 2 + 2);  // 32 triangle polyhedron
+  EXPECT_LE(mesh.maxClusterVertices, 32 * 3);      // 32 unconnected triangles
 
-  const nvclusterlod::HierarchyInput hierarchyInput{
-      .clusterGeneratingGroups     = mesh.lodMesh.clusterGeneratingGroups.data(),
-      .groupQuadricErrors          = mesh.lodMesh.groupQuadricErrors.data(),
-      .groupClusterRanges          = mesh.lodMesh.groupClusterRanges.data(),
-      .groupCount                  = static_cast<uint32_t>(mesh.lodMesh.groupClusterRanges.size()),
-      .clusterBoundingSpheres      = mesh.lodMesh.clusterBoundingSpheres.data(),
-      .clusterCount                = static_cast<uint32_t>(mesh.lodMesh.clusterBoundingSpheres.size()),
-      .lodLevelGroupRanges         = mesh.lodMesh.lodLevelGroupRanges.data(),
-      .lodLevelCount               = static_cast<uint32_t>(mesh.lodMesh.lodLevelGroupRanges.size()),
-      .minQuadricErrorOverDistance = 0.001f,
-      .conservativeBoundingSpheres = false};
+  const nvclusterlod_HierarchyInput hierarchyInput{
+      .clusterGeneratingGroups = mesh.lodMesh.clusterGeneratingGroups.data(),
+      .clusterBoundingSpheres  = mesh.lodMesh.clusterBoundingSpheres.data(),
+      .groupQuadricErrors      = mesh.lodMesh.groupQuadricErrors.data(),
+      .groupClusterRanges      = mesh.lodMesh.groupClusterRanges.data(),
+      .lodLevelGroupRanges     = mesh.lodMesh.lodLevelGroupRanges.data(),
+      .clusterCount            = static_cast<uint32_t>(mesh.lodMesh.clusterBoundingSpheres.size()),
+      .groupCount              = static_cast<uint32_t>(mesh.lodMesh.groupClusterRanges.size()),
+      .lodLevelCount           = static_cast<uint32_t>(mesh.lodMesh.lodLevelGroupRanges.size()),
+  };
   nvclusterlod::LodHierarchy hierarchy;
   result = nvclusterlod::generateLodHierarchy(lodContext.context, hierarchyInput, hierarchy);
-  ASSERT_EQ(result, nvclusterlod::Result::SUCCESS);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
 
   verifyNodeRecursive(mesh, hierarchy, hierarchy.nodes[0]);
 
@@ -479,14 +476,14 @@ TEST(HierarchyTest, Everything)
   nvclusterlod::GroupGeneratingGroups groupGeneratingGroups;
   result = nvclusterlod::generateGroupGeneratingGroups(mesh.lodMesh.groupClusterRanges,
                                                        mesh.lodMesh.clusterGeneratingGroups, groupGeneratingGroups);
-  ASSERT_EQ(result, nvclusterlod::Result::SUCCESS);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
 
   std::vector<uint32_t> clusterNodes(mesh.lodMesh.clusterTriangleRanges.size());
   for(size_t nodeIndex = 0; nodeIndex < hierarchy.nodes.size(); ++nodeIndex)
   {
-    if(hierarchy.nodes[nodeIndex].clusters.isLeafNode)
+    if(hierarchy.nodes[nodeIndex].clusterGroup.isClusterGroup)
     {
-      const nvcluster::Range& clusterIndices = mesh.lodMesh.groupClusterRanges[hierarchy.nodes[nodeIndex].clusters.group];
+      const nvcluster_Range& clusterIndices = mesh.lodMesh.groupClusterRanges[hierarchy.nodes[nodeIndex].clusterGroup.group];
       for(uint32_t i = clusterIndices.offset; i < clusterIndices.offset + clusterIndices.count; i++)
       {
         clusterNodes[i] = uint32_t(nodeIndex);
@@ -501,17 +498,17 @@ TEST(HierarchyTest, Everything)
   // Loop from mesh.lodMesh.groupClusterRanges.size() - 1 to 0.
   for(size_t groupIndex = mesh.lodMesh.groupClusterRanges.size(); (groupIndex--) > 0;)
   {
-    const nvcluster::Range groupClusterRange = mesh.lodMesh.groupClusterRanges[groupIndex];
+    const nvcluster_Range groupClusterRange = mesh.lodMesh.groupClusterRanges[groupIndex];
     for(uint32_t clusterIndex = groupClusterRange.offset;
         clusterIndex < groupClusterRange.offset + groupClusterRange.count; clusterIndex++)
     {
       const uint32_t generatingGroupIndex = mesh.lodMesh.clusterGeneratingGroups[clusterIndex];
-      if(generatingGroupIndex == nvclusterlod::ORIGINAL_MESH_GROUP)
+      if(generatingGroupIndex == NVCLUSTERLOD_ORIGINAL_MESH_GROUP)
         continue;
       for(uint32_t generatingGeneratingGroupIndex : groupGeneratingGroups[generatingGroupIndex])
       {
         uint32_t               lastNode = 0xffffffff;  // Initialize to some value that doesn't appear in clusterNodes
-        const nvcluster::Range generatingGeneratingClusterRange = mesh.lodMesh.groupClusterRanges[generatingGeneratingGroupIndex];
+        const nvcluster_Range generatingGeneratingClusterRange = mesh.lodMesh.groupClusterRanges[generatingGeneratingGroupIndex];
         for(uint32_t i = 0; i < generatingGeneratingClusterRange.count; i++)
         {
           const uint32_t generatingGeneratingClusterIndex = generatingGeneratingClusterRange.offset + i;
@@ -531,14 +528,69 @@ TEST(HierarchyTest, Everything)
   }
 };
 
+TEST(Mesh, VertexLimit)
+{
+  ScopedContext context;
+  ASSERT_EQ(context.init(), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+  ScopedLodContext lodContext;
+  ASSERT_EQ(lodContext.init(context.context), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+
+  GeometryMesh           icosphere{makeIcosphere(4)};
+  nvclusterlod_MeshInput meshInput{
+      .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
+      .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
+      .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
+      .vertexCount      = static_cast<uint32_t>(icosphere.positions.size()),
+      .vertexStride     = sizeof(vec3),
+      .clusterConfig =
+          {
+              .minClusterSize        = 1,
+              .maxClusterSize        = 1000,
+              .maxClusterVertices    = 32,
+              .costUnderfill         = 0.9f,
+              .costOverlap           = 0.5f,
+              .costUnderfillVertices = 0.9f,
+              .preSplitThreshold     = 1u << 17,
+          },
+      .groupConfig =
+          {
+              .minClusterSize    = 32,
+              .maxClusterSize    = 32,
+              .costUnderfill     = 0.5f,
+              .costOverlap       = 0.0f,
+              .preSplitThreshold = 0,
+          },
+      .decimationFactor = 0.5f,
+  };
+
+  nvclusterlod::LocalizedLodMesh mesh;
+  nvclusterlod_Result            result = nvclusterlod::generateLocalizedLodMesh(lodContext.context, meshInput, mesh);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+  EXPECT_LE(mesh.maxClusterVertices, meshInput.clusterConfig.maxClusterVertices);
+  for(size_t i = 0; i < mesh.lodMesh.clusterTriangleRanges.size(); ++i)
+  {
+    const nvcluster_Range& triangleRange = mesh.lodMesh.clusterTriangleRanges[i];
+    EXPECT_LE(triangleRange.count, mesh.maxClusterTriangles);
+    std::unordered_set<uint32_t> uniqueVertices;
+    for(size_t j = 0; j < triangleRange.count; ++j)
+    {
+      const nvclusterlod_Vec3u& vertex = mesh.lodMesh.triangleVertices[triangleRange.offset + j];
+      uniqueVertices.insert(vertex.x);
+      uniqueVertices.insert(vertex.y);
+      uniqueVertices.insert(vertex.z);
+    }
+    EXPECT_LE(uniqueVertices.size(), mesh.maxClusterVertices);
+  }
+}
+
 TEST(Hierarchy, AngularError)
 {
   {
     // Test with some hard coded ballpark-real values
     const float fov  = M_PIf * 0.5f;
-    const float qeod = nvclusterlod::pixelErrorToQuadricErrorOverDistance(1.0f, fov, 2048.0f);
+    const float qeod = nvclusterlodErrorOverDistance(1.0f, fov, 2048.0f);
     EXPECT_NEAR(qeod, 0.0004f, 0.0001f);
-    EXPECT_NEAR(nvclusterlod::quadricErrorOverDistanceToPixelError(qeod, fov, 2048.0f), 1.0f, 1e-10f);
+    EXPECT_NEAR(nvclusterlodPixelError(qeod, fov, 2048.0f), 1.0f, 1e-10f);
   }
 
   // Verify the reverse mapping works for many values
@@ -550,8 +602,15 @@ TEST(Hierarchy, AngularError)
     {
       // TODO: would be nice if the precision were a bit better even for the
       // more extreme values
-      float qeod = nvclusterlod::pixelErrorToQuadricErrorOverDistance(errorSize, fov, 2048.0f);
-      EXPECT_NEAR(nvclusterlod::quadricErrorOverDistanceToPixelError(qeod, fov, 2048.0f), errorSize, 1e-4f);
+      float qeod = nvclusterlodErrorOverDistance(errorSize, fov, 2048.0f);
+      EXPECT_NEAR(nvclusterlodPixelError(qeod, fov, 2048.0f), errorSize, 1e-4f);
     }
   }
+}
+
+extern "C" int runCTest(void);
+
+TEST(CAPI, Contexts)
+{
+  EXPECT_EQ(runCTest(), 1);
 }

@@ -16,7 +16,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.20)
-project(nv_cluster_lod_builder)
+project(nv_cluster_lod_builder VERSION 2.0)
 
 option(NVCLUSTERLOD_MULTITHREADED "Use parallel algorithms to generate clusters." ON)
 
@@ -27,24 +27,41 @@ if(NOT TARGET nv_cluster_builder)
   add_subdirectory(nv_cluster_builder)
 endif()
 
-
 file(GLOB SOURCES src/*.h src/*.hpp src/*.c src/*.cpp)
 file(GLOB HEADERS include/nvclusterlod/*.h include/nvclusterlod/*.hpp )
 
 source_group("public_include" FILES ${HEADERS})
 source_group("source" FILES ${SOURCES})
 
-add_library(nv_cluster_lod_builder ${SOURCES} ${HEADERS})
-target_compile_features(nv_cluster_lod_builder PUBLIC cxx_std_20)
+# Optionally build as a shared library
+include(CMakeDependentOption)
+cmake_dependent_option(
+  NVCLUSTERLOD_BUILDER_SHARED  # option variable
+  "Build shared library"       # description
+  OFF                          # default value if exposed; user can override
+  "NOT BUILD_SHARED_LIBS"      # condition to expose option
+  ON                           # value if not exposed; user can't override
+)
 
+if (NVCLUSTERLOD_BUILDER_SHARED)
+  set(CMAKE_C_VISIBILITY_PRESET hidden)
+  set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+  set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
+  add_library(nv_cluster_lod_builder SHARED ${SOURCES} ${HEADERS})
+  target_compile_definitions(nv_cluster_lod_builder PUBLIC NVCLUSTERLOD_BUILDER_SHARED)
+else()
+  add_library(nv_cluster_lod_builder STATIC ${SOURCES} ${HEADERS})
+endif ()
+target_compile_features(nv_cluster_lod_builder PUBLIC cxx_std_20)
 target_include_directories(nv_cluster_lod_builder PUBLIC include)
 target_include_directories(nv_cluster_lod_builder PRIVATE src)
+target_compile_definitions(nv_cluster_lod_builder PRIVATE NVCLUSTERLOD_BUILDER_COMPILING)
 
 # All the warnings. Branch on COMPILE_LANGUAGE to avoid passing unknowns to nvcc
 if(MSVC)
     target_compile_options(nv_cluster_lod_builder PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W4>
-        #$<$<COMPILE_LANGUAGE:CXX>:/WX>
+        $<$<COMPILE_LANGUAGE:CXX>:/WX>
     )
     target_compile_definitions(nv_cluster_lod_builder PRIVATE WIN32_LEAN_AND_MEAN=1 NOMINMAX)
 else()
@@ -55,9 +72,6 @@ else()
         $<$<COMPILE_LANGUAGE:CXX>:-Wshadow>
         $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
         $<$<COMPILE_LANGUAGE:CXX>:-Werror>
-
-        # TODO: fix these
-        $<$<COMPILE_LANGUAGE:CXX>:-Wno-return-type-c-linkage> # namespaces are not a thing in C
     )
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         target_compile_definitions(nv_cluster_lod_builder PRIVATE
@@ -93,3 +107,5 @@ if(BUILD_TESTING)
     add_subdirectory(test)
   endif()
 endif()
+
+install(TARGETS nv_cluster_lod_builder)

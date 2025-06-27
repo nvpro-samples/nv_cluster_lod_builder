@@ -110,7 +110,7 @@ struct iota_iterator
   bool                 operator<=(const iota_iterator& other) const { return i <= other.i; }
   bool                 operator>(const iota_iterator& other) const { return i > other.i; }
   bool                 operator>=(const iota_iterator& other) const { return i >= other.i; }
-  difference_type      operator-(const iota_iterator& other) const { return i - other.i; }
+  difference_type      operator-(const iota_iterator& other) const { return static_cast<difference_type>(i) - static_cast<difference_type>(other.i); }
   friend iota_iterator operator+(difference_type n, const iota_iterator& it) { return it + n; }
   T operator[](difference_type d) const { return static_cast<T>(static_cast<difference_type>(i) + d); }
 

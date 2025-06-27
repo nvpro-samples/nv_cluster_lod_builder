@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+  <Type Name="meshops::ArrayView&lt;*&gt;">
+    <DisplayString>{{ size={m_size} }}</DisplayString>
+    <Expand>
+      <Item Name="[ptr]" >m_ptr</Item>
+      <Item Name="[size]" >m_size</Item>
+      <Item Name="[stride]" >m_stride</Item>
+      <IndexListItems>
+        <Size>m_size</Size>
+        <ValueNode>*(value_type*)((uint8_t*)m_ptr + $i * m_stride)</ValueNode>
+      </IndexListItems>
+    </Expand>
+  </Type>
+</AutoVisualizer>

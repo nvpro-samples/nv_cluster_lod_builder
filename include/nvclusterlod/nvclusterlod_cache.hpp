@@ -22,6 +22,7 @@
 #include <cassert>
 #include <cstring>
 
+#include "nvclusterlod_common.h"
 #include "nvclusterlod_hierarchy_storage.hpp"
 #include "nvclusterlod_mesh_storage.hpp"
 
@@ -61,7 +62,7 @@ inline void storeAndAdvance(bool& isValid, uint64_t& dataAddress, uint64_t dataE
     // store count first
     memcpy(reinterpret_cast<void*>(dataAddress), countData, ALIGNMENT);
     dataAddress += ALIGNMENT;
-
+    
     if(view.size())
     {
       // then data
@@ -111,13 +112,13 @@ inline void loadAndAdvance(bool& isValid, uint64_t& dataAddress, uint64_t dataEn
 
 struct LodMeshView
 {
-  std::span<const uint32_t>         triangleVertices;
-  std::span<const nvcluster::Range> clusterTriangleRanges;
-  std::span<const uint32_t>         clusterGeneratingGroups;
-  std::span<const Sphere>           clusterBoundingSpheres;
-  std::span<const float>            groupQuadricErrors;
-  std::span<const nvcluster::Range> groupClusterRanges;
-  std::span<const nvcluster::Range> lodLevelGroupRanges;
+  std::span<const nvclusterlod_Vec3u>  triangleVertices;
+  std::span<const nvcluster_Range>     clusterTriangleRanges;
+  std::span<const uint32_t>            clusterGeneratingGroups;
+  std::span<const nvclusterlod_Sphere> clusterBoundingSpheres;
+  std::span<const float>               groupQuadricErrors;
+  std::span<const nvcluster_Range>     groupClusterRanges;
+  std::span<const nvcluster_Range>     lodLevelGroupRanges;
 };
 
 inline void toView(const LodMesh& storage, LodMeshView& view)
@@ -203,9 +204,9 @@ inline bool loadCached(LodMeshView& view, uint64_t dataSize, const void* data)
 
 struct LodHierarchyView
 {
-  std::span<const Node>   nodes;
-  std::span<const Sphere> groupCumulativeBoundingSpheres;
-  std::span<const float>  groupCumulativeQuadricError;
+  std::span<const nvclusterlod_HierarchyNode> nodes;
+  std::span<const nvclusterlod_Sphere>        groupCumulativeBoundingSpheres;
+  std::span<const float>                      groupCumulativeQuadricError;
 };
 
 inline void toView(const LodHierarchy& storage, LodHierarchyView& view)
@@ -279,13 +280,13 @@ inline bool loadCached(LodHierarchyView& view, uint64_t dataSize, const void* da
 struct LodGeometryInfo
 {
   // details of the original mesh are embedded for compatibility
-  uint64_t          inputTriangleCount       = 0;
-  uint64_t          inputVertexCount         = 0;
-  uint64_t          inputTriangleIndicesHash = 0;
-  uint64_t          inputVerticesHash        = 0;
-  nvcluster::Config clusterConfig;
-  nvcluster::Config groupConfig;
-  float             decimationFactor = 0;
+  uint64_t         inputTriangleCount       = 0;
+  uint64_t         inputVertexCount         = 0;
+  uint64_t         inputTriangleIndicesHash = 0;
+  uint64_t         inputVerticesHash        = 0;
+  nvcluster_Config clusterConfig;
+  nvcluster_Config groupConfig;
+  float            decimationFactor = 0;
 };
 
 struct LodGeometryView
@@ -359,11 +360,8 @@ class CacheHeader
 public:
   CacheHeader()
   {
+    std::fill(std::begin(data), std::end(data), 0);
     header = {};
-    if(sizeof(CacheHeader) - sizeof(Header))
-    {
-      memset((&header) + 1, 0, sizeof(CacheHeader) - sizeof(Header));
-    }
   }
 
 private:
@@ -406,7 +404,10 @@ class CacheView
 #endif
 
 public:
-  bool isValid() const { return m_dataSize != 0; }
+  bool isValid() const
+  {
+    return m_dataSize != 0;
+  }
 
   bool init(uint64_t dataSize, const void* data)
   {
@@ -421,7 +422,7 @@ public:
 
     CacheHeader defaultHeader;
 
-    if(memcmp(data, &defaultHeader, sizeof(CacheHeader) != 0))
+    if(memcmp(data, &defaultHeader, sizeof(CacheHeader)) != 0)
     {
       m_dataSize = 0;
       return false;
@@ -440,14 +441,18 @@ public:
     return true;
   }
 
-  void deinit() { *(this) = {}; }
+  void deinit()
+  {
+    *(this) = {};
+  }
 
-  uint64_t getGeometryCount() const { return m_geometryCount; }
+  uint64_t getGeometryCount() const
+  {
+    return m_geometryCount;
+  }
 
   bool getLodGeometryView(LodGeometryView& view, uint64_t geometryIndex) const
   {
-    constexpr uint64_t ALIGN_MASK = detail::ALIGNMENT - 1;
-
     if(geometryIndex >= m_geometryCount)
     {
       assert(0);
@@ -465,7 +470,6 @@ public:
     }
 
     uint64_t geometryTotalSize = geometryOffsets[geometryIndex + 1] - base;
-    uint64_t baseEnd           = base + geometryTotalSize;
 
     const uint8_t* geoData = getPointer<uint8_t>(base, geometryTotalSize);
 
@@ -474,7 +478,7 @@ public:
 
 private:
   template <class T>
-  const T* getPointer(uint64_t offset, uint64_t count = 1) const
+  const T* getPointer(uint64_t offset, [[maybe_unused]] uint64_t count = 1) const
   {
     assert(offset + sizeof(T) * count <= m_dataSize);
     return reinterpret_cast<const T*>(m_dataBytes + offset);

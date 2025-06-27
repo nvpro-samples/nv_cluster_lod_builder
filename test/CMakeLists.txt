@@ -29,6 +29,7 @@ endif()
 
 add_executable(nv_cluster_lod_builder_tests
   src/test_lod.cpp
+  src/test_lod_capi.c
 )
 target_link_libraries(nv_cluster_lod_builder_tests nv_cluster_lod_builder gtest_main gmock_main)
 
@@ -37,6 +38,7 @@ if(MSVC)
     target_compile_options(nv_cluster_lod_builder_tests PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:/W4>
       $<$<COMPILE_LANGUAGE:CXX>:/WX>
+      $<$<COMPILE_LANGUAGE:CXX>:/wd4201> # nonstandard extension used: nameless struct/union
     )
     target_compile_definitions(nv_cluster_lod_builder_tests PRIVATE WIN32_LEAN_AND_MEAN=1 NOMINMAX)
 else()
@@ -47,9 +49,6 @@ else()
       $<$<COMPILE_LANGUAGE:CXX>:-Wshadow>
       $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
       $<$<COMPILE_LANGUAGE:CXX>:-Werror>
-
-      # TODO: fix these
-      $<$<COMPILE_LANGUAGE:CXX>:-Wno-return-type-c-linkage> # namespaces are not a thing in C
     )
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         target_compile_definitions(nv_cluster_lod_builder_tests PRIVATE

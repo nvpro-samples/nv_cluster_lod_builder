@@ -341,28 +341,28 @@ To create LOD data with this library:
 
 ...
 
-// Create contexts for running operations
-nvcluster::Context context;
-nvcluser::ContextCreateInfo contextCreateInfo{};
-nvclusterCreateContext(&contextCreateInfo, &context);
+// Create contexts. One day they may store persistent resources between
+// execution. For now, they are empty and cheap to create per call.
+nvcluster_Context context;
+nvcluster_ContextCreateInfo contextCreateInfo{};
+nvclusterCreateContext(&contextCreateInfo, &context);  // Add error checking
 
-nvclusterlod::Context lodContext;
-nvclusterlod::ContextCreateInfo lodContextCreateInfo{.clusterContext = context};
-nvclusterlodCreateContext(&lodContextCreateInfo, &lodContext);
+nvclusterlod_Context lodContext;
+nvclusterlod_ContextCreateInfo lodContextCreateInfo{.clusterContext = context};
+nvclusterlodCreateContext(&lodContextCreateInfo, &lodContext);  // Add error checking, don't leak context etc.
 
 // Input mesh
-std::vector<uint32_t> indices   = ...;
-std::vector<vec3>     positions = ...;
+std::vector<vec3u> indices   = ...;
+std::vector<vec3f> positions = ...;
 
 // Create decimated clusters
-const nvclusterlod::MeshInput meshInput{
+const nvclusterlod_MeshInput meshInput{
     // Mesh data
-    .indices      = indices.data(),
+    .indices      = reinterpret_cast<const nvclusterlod_Vec3u*>(indices.data()),
     .indexCount   = static_cast<uint32_t>(indices.size()),
-    .vertices     = reinterpret_cast<const float*>(positions.data()),
-    .vertexOffset = 0,
+    .vertices     = reinterpret_cast<const nvcluster_Vec3f*>(positions.data()),
     .vertexCount  = static_cast<uint32_t>(positions.size()),
-    .vertexStride = sizeof(vec3),
+    .vertexStride = sizeof(nvcluster_Vec3f),
     // Use default configurations and decimation factor:
     .clusterConfig = {},
     .clusterGroupConfig = {},
@@ -370,10 +370,10 @@ const nvclusterlod::MeshInput meshInput{
 };
 
 nvclusterlod::LocalizedLodMesh mesh;
-nvclusterlod::generateLocalizedLodMesh(lodContext, meshInput, mesh);
+nvclusterlod::generateLocalizedLodMesh(lodContext, meshInput, mesh);  // Add error checking, don't leak lodContext, context etc.
 
 // Build a spatial hierarchy for faster selection
-const nvclusterlod::HierarchyInput hierarchyInput {
+const nvclusterlod_HierarchyInput hierarchyInput {
     .clusterGeneratingGroups = mesh.lodMesh.clusterGeneratingGroups.data(),
     .groupQuadricErrors      = mesh.lodMesh.groupQuadricErrors.data(),
     .groupClusterRanges      = mesh.lodMesh.groupClusterRanges.data(),
@@ -385,10 +385,14 @@ const nvclusterlod::HierarchyInput hierarchyInput {
 };
 
 nvclusterlod::LodHierarchy hierarchy;
-nvclusterlod::generateLodHierarchy(lodContext, hierarchyInput, hierarchy);
+nvclusterlod::generateLodHierarchy(lodContext, hierarchyInput, hierarchy);  // Add error checking, don't leak lodContext, context etc.
 
 // Upload mesh and hierarchy to the GPU. These are both simple structures of arrays.
 ...
+
+// If not wrapping the C API,
+nvclusterlodDestroyContext(lodContext);
+nvclusterDestroyContext(context);
 ```
 
 **Rendering whole levels of detail**
@@ -397,19 +401,19 @@ nvclusterlod::generateLodHierarchy(lodContext, hierarchyInput, hierarchy);
 // For each LOD level (highest detail first)
 for(size_t lod = 0; lod < mesh.lodMesh.lodLevelGroupRanges.size(); lod++)
 {
-    const nvcluster::Range& lodLevelGroupRange = mesh.lodMesh.lodLevelGroupRanges[lod];
+    const nvcluster_Range& lodLevelGroupRange = mesh.lodMesh.lodLevelGroupRanges[lod];
     glBegin(GL_TRIANGLES);  // Naive OpenGL immediate mode just for illustration
 
     // For each group
     for(uint32_t groupIndex = lodLevelGroupRange.offset; groupIndex < lodLevelGroupRange.offset + lodLevelGroupRange.count; groupIndex++)
     {
-        const nvcluster::Range& groupClusterRange = mesh.lodMesh.groupClusterRanges[groupIndex];
+        const nvcluster_Range& groupClusterRange = mesh.lodMesh.groupClusterRanges[groupIndex];
 
         // For each cluster
         for(uint32_t clusterIndex = groupClusterRange.offset; clusterIndex < groupClusterRange.offset + groupClusterRange.count; clusterIndex++)
         {
-            const nvcluster::Range& clusterTriangleRange = mesh.lodMesh.clusterTriangleRanges[clusterIndex];
-            const nvcluster::Range& clusterVertexRange   = mesh.clusterVertexRanges[clusterIndex];
+            const nvcluster_Range& clusterTriangleRange = mesh.lodMesh.clusterTriangleRanges[clusterIndex];
+            const nvcluster_Range& clusterVertexRange   = mesh.clusterVertexRanges[clusterIndex];
 
             // Can use this to pre-compute a per-cluster vertex array
             const uint32_t* clusterVertexGlobalIndices = &mesh.vertexGlobalIndices[clusterVertexRange.offset];
@@ -519,6 +523,8 @@ download them, run
 ```
 git submodule update --init --recursive
 ```
+
+Parallel execution on linux uses `tbb` if available. For ubuntu, `sudo apt install libtbb-dev`.
 
 ## License
 

@@ -22,53 +22,68 @@
 #include <vector>
 
 #include <nvclusterlod/nvclusterlod_hierarchy.h>
-
+#include <nvclusterlod/nvclusterlod_mesh.h>
 
 namespace nvclusterlod {
 
 // Shortcut and storage for hierarchy output
 struct LodHierarchy
 {
-  std::vector<Node>   nodes;
-  std::vector<Sphere> groupCumulativeBoundingSpheres;
+  std::vector<nvclusterlod_HierarchyNode> nodes;
+  std::vector<nvclusterlod_Sphere>        groupCumulativeBoundingSpheres;
   std::vector<float>  groupCumulativeQuadricError;
 };
 
-
-inline nvclusterlod::Result generateLodHierarchy(nvclusterlod::Context context, const HierarchyInput& input, LodHierarchy& hierarchy)
+inline nvclusterlod_Result generateLodHierarchy(nvclusterlod_Context context, const nvclusterlod_HierarchyInput& input, LodHierarchy& hierarchy)
 {
-  nvclusterlod::HierarchyGetRequirementsInfo reqInfo;
-  reqInfo.input = &input;
-
   // Get conservative output sizes
-  nvclusterlod::HierarchyRequirements sizes = nvclusterlodHierarchyGetRequirements(context, &reqInfo);
+  nvclusterlod_HierarchyCounts sizes;
+  if(nvclusterlod_Result result = nvclusterlodGetHierarchyRequirements(context, &input, &sizes);
+     result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+  {
+    return result;
+  }
 
   // Allocate storage
-  hierarchy.nodes.resize(sizes.maxNodeCount);
+  hierarchy.nodes.resize(sizes.nodeCount);
   hierarchy.groupCumulativeBoundingSpheres.resize(input.groupCount);
   hierarchy.groupCumulativeQuadricError.resize(input.groupCount);
 
   // Pack output pointers
-  HierarchyOutput output;
-
+  nvclusterlod_HierarchyOutput output;
   output.groupCumulativeBoundingSpheres = hierarchy.groupCumulativeBoundingSpheres.data();
   output.groupCumulativeQuadricError    = hierarchy.groupCumulativeQuadricError.data();
-  output.nodeCount                      = sizes.maxNodeCount;
+  output.nodeCount                      = sizes.nodeCount;
   output.nodes                          = hierarchy.nodes.data();
 
-
-  HierarchyCreateInfo createInfo{&input};
-
   // Make LODs
-  nvclusterlod::Result result = nvclusterlodCreateHierarchy(context, &createInfo, &output);
-  if(result != nvclusterlod::Result::SUCCESS)
+  if(nvclusterlod_Result result = nvclusterlodBuildHierarchy(context, &input, &output); result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
   {
     hierarchy = {};
     return result;
   }
   // Truncate to output size written
   hierarchy.nodes.resize(output.nodeCount);
-  return nvclusterlod::Result::SUCCESS;
+  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+}
+
+inline nvclusterlod_HierarchyInput makeHierarchyInput(const nvclusterlod_MeshOutput& meshOutput)
+{
+  return {
+      .clusterGeneratingGroups = meshOutput.clusterGeneratingGroups,
+      .clusterBoundingSpheres  = meshOutput.clusterBoundingSpheres,
+      .groupQuadricErrors      = meshOutput.groupQuadricErrors,
+      .groupClusterRanges      = meshOutput.groupClusterRanges,
+      .lodLevelGroupRanges     = meshOutput.lodLevelGroupRanges,
+      .clusterCount            = meshOutput.clusterCount,
+      .groupCount              = meshOutput.groupCount,
+      .lodLevelCount           = meshOutput.lodLevelCount,
+  };
+}
+
+inline nvclusterlod_Result generateLodHierarchy(nvclusterlod_Context context, const nvclusterlod_MeshOutput& meshOutput, LodHierarchy& hierarchy)
+{
+  return generateLodHierarchy(context, makeHierarchyInput(meshOutput), hierarchy);
 }
 
 }  // namespace nvclusterlod
