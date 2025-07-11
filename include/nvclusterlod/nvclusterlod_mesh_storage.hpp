@@ -42,6 +42,19 @@ struct LodMesh
     lodLevelGroupRanges.resize(counts.lodLevelCount);
   }
 
+  void shrink_to_fit()
+  {
+    // If keeping the object around, reallocating the conservatively sized
+    // output memory is worthwhile.
+    triangleVertices.shrink_to_fit();
+    clusterTriangleRanges.shrink_to_fit();
+    clusterGeneratingGroups.shrink_to_fit();
+    clusterBoundingSpheres.shrink_to_fit();
+    groupQuadricErrors.shrink_to_fit();
+    groupClusterRanges.shrink_to_fit();
+    lodLevelGroupRanges.shrink_to_fit();
+  }
+
   std::vector<nvclusterlod_Vec3u>  triangleVertices;
   std::vector<nvcluster_Range>     clusterTriangleRanges;
   std::vector<uint32_t>            clusterGeneratingGroups;

@@ -31,7 +31,14 @@ struct LodHierarchy
 {
   std::vector<nvclusterlod_HierarchyNode> nodes;
   std::vector<nvclusterlod_Sphere>        groupCumulativeBoundingSpheres;
-  std::vector<float>  groupCumulativeQuadricError;
+  std::vector<float>                      groupCumulativeQuadricError;
+
+  void shrink_to_fit()
+  {
+    // nodes is conservatively sized for hierarchy output. If this object is
+    // kept around, memory can be saved by reallocating.
+    nodes.shrink_to_fit();
+  }
 };
 
 inline nvclusterlod_Result generateLodHierarchy(nvclusterlod_Context context, const nvclusterlod_HierarchyInput& input, LodHierarchy& hierarchy)
