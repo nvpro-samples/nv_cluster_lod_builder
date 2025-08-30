@@ -22,6 +22,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <limits>
+#include <nvcluster/util/objects.hpp>
 #include <nvclusterlod/nvclusterlod_cache.hpp>
 #include <nvclusterlod/nvclusterlod_common.h>
 #include <nvclusterlod/nvclusterlod_hierarchy.h>
@@ -33,76 +34,27 @@
 #include <span>
 #include <unordered_map>
 
+using nvcluster::vec3f;
+using nvcluster::vec3u;
+using nvcluster::vec4f;
+
 #ifndef M_PIf
 #define M_PIf 3.1415926535f
 #endif
 
-// GLSL-like type definitions
-using uvec3 = std::array<uint32_t, 3>;
-using vec3  = std::array<float, 3>;
-using vec4  = std::array<float, 4>;
-
-vec3 getSpherePosition(const nvclusterlod_Sphere& sphere)
+struct Sphere
 {
-  return vec3{sphere.center.x, sphere.center.y, sphere.center.z};
-}
-
-// Adds two vec3s.
-vec3 add(const vec3& a, const vec3& b)
-{
-  return vec3{a[0] + b[0], a[1] + b[1], a[2] + b[2]};
-}
-
-// Subtracts two vec3s.
-vec3 sub(const vec3& a, const vec3& b)
-{
-  return vec3{a[0] - b[0], a[1] - b[1], a[2] - b[2]};
-}
-
-// Multiplies a vec3 by a constant value.
-vec3 mul(const vec3& v, float a)
-{
-  return vec3{v[0] * a, v[1] * a, v[2] * a};
-}
-
-// Returns the squared length of a vec3.
-float lengthSquared(const vec3& v)
-{
-  return v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-}
-
-// Returns the length of a vec3.
-float length(const vec3& v)
-{
-  return std::sqrt(lengthSquared(v));
-}
-
-// Normalizes a vec3.
-vec3 normalize(const vec3& v)
-{
-  const float vecLength = length(v);
-  const float factor    = (vecLength == 0.0f) ? 1.0f : (1.0f / vecLength);
-  return mul(v, factor);
-}
-
-// Define a hash for vec3, so that we can use it in std::unordered_map.
-template <>
-struct std::hash<vec3>
-{
-  std::size_t operator()(const vec3& v) const noexcept
-  {
-    // This doesn't need to be a good hash; it just needs to exist.
-    const std::hash<float> hasher{};
-    return hasher(v[0]) + 3 * hasher(v[1]) + 5 * hasher(v[2]);
-  }
+  vec3f center;
+  float radius;
+  bool  operator==(const Sphere& other) const { return center == other.center && radius == other.radius; }
+  operator nvclusterlod_Sphere() const { return {center, radius}; }
 };
-
 
 struct mat4
 {
-  std::array<vec4, 4> columns{};
-  static mat4         identity() { return mat4{.columns = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}}}}; }
-  static mat4         makeTranslation(vec3 translation)
+  std::array<vec4f, 4> columns{};
+  static mat4 identity() { return mat4{.columns = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}}}}; }
+  static mat4 makeTranslation(vec3f translation)
   {
     mat4 result = mat4::identity();
     for(size_t i = 0; i < 3; i++)
@@ -113,9 +65,9 @@ struct mat4
   }
 };
 
-vec3 transformPoint(const mat4& t, const vec3& point)
+vec3f transformPoint(const mat4& t, const vec3f& point)
 {
-  vec3 result = {t.columns[3][0], t.columns[3][1], t.columns[3][2]};
+  vec3f result = {t.columns[3][0], t.columns[3][1], t.columns[3][2]};
   for(size_t i = 0; i < 3; i++)
   {
     for(size_t row = 0; row < 3; row++)
@@ -126,11 +78,12 @@ vec3 transformPoint(const mat4& t, const vec3& point)
   return result;
 }
 
-// Random number generator.
-std::default_random_engine rng(123);
 // Returns a uniform random point on a sphere.
-vec3 randomPointOnSphere(const nvclusterlod_Sphere& sphere)
+vec3f randomPointOnSphere(const Sphere& sphere)
 {
+  // Random number generator
+  static std::default_random_engine rng(123);  // not thread safe
+
   // From https://www.pbr-book.org/4ed/Sampling_Algorithms/Sampling_Multidimensional_Functions#UniformlySamplingHemispheresandSpheres
 
   // Random Z coordinate on a unit sphere, in the range [-1, 1].
@@ -138,16 +91,16 @@ vec3 randomPointOnSphere(const nvclusterlod_Sphere& sphere)
   // Choose a random point on the surface of the sphere at this z coordinate:
   const float r                  = sqrtf(1.F - z * z);
   const float phi                = 2.0f * M_PIf * (static_cast<float>(rng()) / static_cast<float>(rng.max()));
-  const vec3  randomOnUnitSphere = {r * cosf(phi), r * sinf(phi), z};
+  const vec3f randomOnUnitSphere = {r * cosf(phi), r * sinf(phi), z};
   // Now scale and translate this.
-  return add(getSpherePosition(sphere), mul(randomOnUnitSphere, sphere.radius));
+  return sphere.center + randomOnUnitSphere * sphere.radius;
 }
 
 // Icosahedron data.
 namespace icosahedron {
 constexpr float              X         = .525731112119133606f;
 constexpr float              Z         = .850650808352039932f;
-static std::array<vec3, 12>  positions = {{{-X, 0.0, Z},
+static std::array<vec3f, 12> positions = {{{-X, 0.0, Z},
                                            {X, 0.0, Z},
                                            {-X, 0.0, -Z},
                                            {X, 0.0, -Z},
@@ -159,7 +112,7 @@ static std::array<vec3, 12>  positions = {{{-X, 0.0, Z},
                                            {-Z, X, 0.0},
                                            {Z, -X, 0.0},
                                            {-Z, -X, 0.0}}};
-static std::array<uvec3, 20> triangles = {{{0, 4, 1},  {0, 9, 4},  {9, 5, 4},  {4, 5, 8},  {4, 8, 1},
+static std::array<vec3u, 20> triangles = {{{0, 4, 1},  {0, 9, 4},  {9, 5, 4},  {4, 5, 8},  {4, 8, 1},
                                            {8, 10, 1}, {8, 3, 10}, {5, 3, 8},  {5, 2, 3},  {2, 7, 3},
                                            {7, 10, 3}, {7, 6, 10}, {7, 11, 6}, {11, 0, 6}, {0, 1, 6},
                                            {6, 1, 10}, {9, 0, 11}, {9, 11, 2}, {9, 2, 5},  {7, 2, 11}}};
@@ -167,11 +120,11 @@ static std::array<uvec3, 20> triangles = {{{0, 4, 1},  {0, 9, 4},  {9, 5, 4},  {
 
 // Type of a function to call when creating a triangle. Takes 3 positions as
 // inputs.
-using triangle_callback = std::function<void(vec3, vec3, vec3)>;
+using triangle_callback = std::function<void(vec3f, vec3f, vec3f)>;
 
 // Recursively subdivides a triangle on a sphere by a factor of 2^depth.
 // Calls the callback function on each new triangle.
-void subdivide(vec3 v0, vec3 v1, vec3 v2, int depth, triangle_callback& callback)
+void subdivide(vec3f v0, vec3f v1, vec3f v2, int depth, triangle_callback& callback)
 {
   if(depth == 0)
   {
@@ -179,9 +132,9 @@ void subdivide(vec3 v0, vec3 v1, vec3 v2, int depth, triangle_callback& callback
   }
   else
   {
-    vec3 v01 = normalize(add(v0, v1));
-    vec3 v12 = normalize(add(v1, v2));
-    vec3 v20 = normalize(add(v2, v0));
+    vec3f v01 = normalize(v0 + v1);
+    vec3f v12 = normalize(v1 + v2);
+    vec3f v20 = normalize(v2 + v0);
     subdivide(v0, v01, v20, depth - 1, callback);
     subdivide(v1, v12, v01, depth - 1, callback);
     subdivide(v2, v20, v12, depth - 1, callback);
@@ -194,15 +147,15 @@ void makeIcosphere(int depth, triangle_callback& callback)
 {
   for(size_t i = 0; i < icosahedron::triangles.size(); i++)
   {
-    const vec3 v0 = icosahedron::positions[icosahedron::triangles[i][0]];
-    const vec3 v1 = icosahedron::positions[icosahedron::triangles[i][1]];
-    const vec3 v2 = icosahedron::positions[icosahedron::triangles[i][2]];
+    const vec3f v0 = icosahedron::positions[icosahedron::triangles[i][0]];
+    const vec3f v1 = icosahedron::positions[icosahedron::triangles[i][1]];
+    const vec3f v2 = icosahedron::positions[icosahedron::triangles[i][2]];
     subdivide(v0, v1, v2, depth, callback);
   }
 }
 
 // Writes the geometry part of the Wavefront .obj format to a stream.
-void writeObjGeometry(std::ostream& os, std::span<const uvec3> triangles, std::span<const vec3> positions)
+void writeObjGeometry(std::ostream& os, std::span<const vec3u> triangles, std::span<const vec3f> positions)
 {
   for(auto& p : positions)
   {
@@ -217,8 +170,8 @@ void writeObjGeometry(std::ostream& os, std::span<const uvec3> triangles, std::s
 
 struct GeometryMesh
 {
-  std::vector<uvec3> triangles;
-  std::vector<vec3>  positions;
+  std::vector<vec3u> triangles;
+  std::vector<vec3f> positions;
   void               writeObj(const std::string& path)
   {
     std::ofstream f(path);
@@ -229,20 +182,20 @@ struct GeometryMesh
 
 GeometryMesh makeIcosphere(int subdivision)
 {
-  std::unordered_map<vec3, uint32_t> vertexCache;
-  std::vector<uvec3>                 triangles;
+  std::unordered_map<vec3f, uint32_t> vertexCache;
+  std::vector<vec3u>                  triangles;
   // Our triangle callback function tries to place each of the vertices in the
   // vertex cache; each of the `it` iterators point to the existing value if
   // the vertex was already in the cache, or to a new value at the end of the
   // cache if it's a new vertex.
-  triangle_callback callback = [&vertexCache, &triangles](vec3 v0, vec3 v1, vec3 v2) {
+  triangle_callback callback = [&vertexCache, &triangles](vec3f v0, vec3f v1, vec3f v2) {
     auto [it0, new0] = vertexCache.try_emplace(v0, static_cast<uint32_t>(vertexCache.size()));
     auto [it1, new1] = vertexCache.try_emplace(v1, static_cast<uint32_t>(vertexCache.size()));
     auto [it2, new2] = vertexCache.try_emplace(v2, static_cast<uint32_t>(vertexCache.size()));
     triangles.push_back({it0->second, it1->second, it2->second});
   };
   makeIcosphere(subdivision, callback);
-  std::vector<vec3> positions(vertexCache.size());
+  std::vector<vec3f> positions(vertexCache.size());
   for(const auto& [position, index] : vertexCache)
   {
     positions[index] = position;
@@ -252,11 +205,12 @@ GeometryMesh makeIcosphere(int subdivision)
 
 // Computes the conservative maximum arcsine of any geometric error relative to
 // the camera, where 'transform' defines a transformation to eye-space.
-float conservativeErrorOverDistance(const mat4& transform, const nvclusterlod_Sphere& boundingSphere, float objectSpaceQuadricError)
+float conservativeErrorOverDistance(const mat4& transform, const nvclusterlod_Sphere& boundingSphereC, float objectSpaceQuadricError)
 {
+  auto  boundingSphere = std::bit_cast<Sphere>(boundingSphereC);
   float radiusScale    = 1.0f;
   float maxError       = objectSpaceQuadricError * radiusScale;
-  float sphereDistance = length(transformPoint(transform, getSpherePosition(boundingSphere)));
+  float sphereDistance = length(transformPoint(transform, boundingSphere.center));
   float errorDistance  = std::max(maxError, sphereDistance - boundingSphere.radius * radiusScale);
   return maxError / errorDistance;
 }
@@ -271,22 +225,29 @@ bool renderCluster(const mat4& viewInstanceTransform, float quadricError, const 
   return conservativeErrorOverDistance(viewInstanceTransform, boundingSphere, quadricError) < errorOverDistanceThreshold;
 }
 
-bool traverseChild(const vec3& cameraPosition, const nvclusterlod_HierarchyNode& node, float errorOverDistanceThreshold)
+bool traverseChild(const vec3f& cameraPosition, const nvclusterlod_HierarchyNode& node, float errorOverDistanceThreshold)
 {
-  return traverseChild(mat4::makeTranslation(mul(cameraPosition, -1.f)), node, errorOverDistanceThreshold);
+  return traverseChild(mat4::makeTranslation(-cameraPosition), node, errorOverDistanceThreshold);
 }
 
-bool renderCluster(const vec3& cameraPosition, float quadricError, const nvclusterlod_Sphere& boundingSphere, float errorOverDistanceThreshold)
+bool renderCluster(const vec3f& cameraPosition, float quadricError, const nvclusterlod_Sphere& boundingSphere, float errorOverDistanceThreshold)
 {
-  return renderCluster(mat4::makeTranslation(mul(cameraPosition, -1.f)), quadricError, boundingSphere, errorOverDistanceThreshold);
+  return renderCluster(mat4::makeTranslation(-cameraPosition), quadricError, boundingSphere, errorOverDistanceThreshold);
 }
 
 // Returns whether `inner` is inside or equal to `outer`.
-bool isInside(const nvclusterlod_Sphere& inner, const nvclusterlod_Sphere& outer)
+bool isInside(const Sphere& inner, const Sphere& outer)
 {
   const float radiusDifference = outer.radius - inner.radius;
   return (radiusDifference >= 0.0f)  // if this is negative then `inner` cannot be inside `outer`
-         && lengthSquared(sub(getSpherePosition(inner), getSpherePosition(outer))) <= radiusDifference * radiusDifference;
+         && length_squared(inner.center - outer.center) <= radiusDifference * radiusDifference;
+}
+
+bool isInside(const nvclusterlod_Sphere& inner, const nvclusterlod_Sphere& outer)
+{
+  auto innerSphere = std::bit_cast<Sphere>(inner);
+  auto outerSphere = std::bit_cast<Sphere>(outer);
+  return isInside(innerSphere, outerSphere);
 }
 
 // Verifies that for this node:
@@ -304,13 +265,39 @@ void verifyNodeRecursive(const nvclusterlod::LocalizedLodMesh& m, const nvcluste
     const nvcluster_Range& clusterRange = m.lodMesh.groupClusterRanges[node.clusterGroup.group];
     for(uint32_t i = 0; i < clusterRange.count; i++)
     {
-      const nvclusterlod_Sphere& clusterSphere = m.lodMesh.clusterBoundingSpheres[clusterRange.offset + i];
+      const nvclusterlod_Sphere& clusterOriginalSphere = m.lodMesh.clusterBoundingSpheres[clusterRange.offset + i];
+      const nvclusterlod_Sphere& clusterGroupSphere    = h.groupCumulativeBoundingSpheres[node.clusterGroup.group];
+
+      // Generally, the original cluster bounding sphere should be inside the
+      // cumulative cluster bounding spheres. However, it is not included in the
+      // cumulative sphere computation. If it is slightly oversized, it can poke
+      // outside of the bounding sphere of the generating groups.
+      auto biggerNodeSphere = node.boundingSphere;
+      biggerNodeSphere.radius *= 1.1f;
+      EXPECT_TRUE(isInside(clusterOriginalSphere, biggerNodeSphere));
 #if 0  // For debugging
-          printf("A = Sphere((%f, %f, %f), %f)\n", node.boundingSphere.x, node.boundingSphere.y, node.boundingSphere.z, node.boundingSphere.radius);
-          printf("B = Sphere((%f, %f, %f), %f)\n", clusterSphere.x, clusterSphere.y, clusterSphere.z, clusterSphere.radius);
-          assert(isInside(clusterSphere, node.boundingSphere));
+      printf("A = Sphere((%f, %f, %f), %f)\n", node.boundingSphere.center.x, node.boundingSphere.center.y,
+              node.boundingSphere.center.z, node.boundingSphere.radius);
+      printf("B = Sphere((%f, %f, %f), %f)\n", clusterOriginalSphere.center.x, clusterOriginalSphere.center.y, clusterOriginalSphere.center.z,
+        clusterOriginalSphere.radius);
+      assert(isInside(clusterOriginalSphere, node.boundingSphere));
 #endif
-      EXPECT_TRUE(isInside(clusterSphere, node.boundingSphere));
+
+      // All but the per-LOD level root node bounding spheres should come from
+      // the group cumulative bounding spheres
+      if(node.boundingSphere.radius != std::numeric_limits<float>::max())
+      {
+        EXPECT_EQ(std::bit_cast<Sphere>(node.boundingSphere), std::bit_cast<Sphere>(clusterGroupSphere));
+      }
+
+      // Cluster group cumulative bounding spheres should enclose the generating
+      // group spheres
+      uint32_t clusterGeneratingGroupIndex = m.lodMesh.clusterGeneratingGroups[clusterRange.offset + i];
+      if(clusterGeneratingGroupIndex != NVCLUSTERLOD_ORIGINAL_MESH_GROUP)
+      {
+        const nvclusterlod_Sphere& clusterGeneratingGroupSphere = h.groupCumulativeBoundingSpheres[clusterGeneratingGroupIndex];
+        EXPECT_TRUE(isInside(clusterGeneratingGroupSphere, node.boundingSphere));
+      }
     }
   }
   else
@@ -355,7 +342,7 @@ void verifyMutuallyExclusive(const nvclusterlod::LocalizedLodMesh& m,
 
   for(int i = 0; i < 10; ++i)
   {
-    const vec3 testCameraPos = randomPointOnSphere(node0.boundingSphere);
+    const vec3f testCameraPos = randomPointOnSphere(std::bit_cast<Sphere>(node0.boundingSphere));
     const bool begin0        = traverseChild(testCameraPos, node0, errorOverDistanceThreshold);
     const bool begin1        = traverseChild(testCameraPos, node1, errorOverDistanceThreshold);
     bool       end0 = !renderCluster(testCameraPos, cluster0QuadricError, cluster0Sphere, errorOverDistanceThreshold);
@@ -375,60 +362,67 @@ void writeDebugLodMesh(const std::string& filename, const GeometryMesh& mesh, co
     f << "o cluster" << clusterIndex << "\n";
     f << "g cluster" << clusterIndex << "\n";
     const nvcluster_Range& triangleRange = lodMesh.clusterTriangleRanges[clusterIndex];
-    const uvec3* pTriangleVertices = reinterpret_cast<const uvec3*>(lodMesh.triangleVertices.data()) + triangleRange.offset;
+    const vec3u* pTriangleVertices = reinterpret_cast<const vec3u*>(lodMesh.triangleVertices.data()) + triangleRange.offset;
     writeObjGeometry(f, {pTriangleVertices, triangleRange.count}, {});
   }
 }
 
-// This nvcluster_Context cleans itself up so that we don't leak memory if
-// a test exits early.
+inline void check(nvcluster_Result result)
+{
+  if(result != nvcluster_Result::NVCLUSTER_SUCCESS)
+    throw std::runtime_error(nvclusterResultString(result));
+}
+
+inline void check(nvclusterlod_Result result)
+{
+  if(result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    throw std::runtime_error(nvclusterlodResultString(result));
+}
+
+// nvcluster_Context wrapper handles ownership, lifetime, doesn't leak when
+// tests return etc.
 struct ScopedContext
 {
-  nvcluster_Context context = nullptr;
-
-  nvcluster_Result init()
+  ScopedContext(const nvcluster_ContextCreateInfo& createInfo = {})
   {
-    assert(!context);
-    nvcluster_ContextCreateInfo info{};
-    return nvclusterCreateContext(&info, &context);
+    check(nvclusterCreateContext(&createInfo, &context));
   }
-
   ~ScopedContext() { std::ignore = nvclusterDestroyContext(context); }
+  ScopedContext(const ScopedContext& other)            = delete;
+  ScopedContext& operator=(const ScopedContext& other) = delete;
+  operator nvcluster_Context() const { return context; }
+  nvcluster_Context context = nullptr;
 };
 
-// This nvclusterlod_Context cleans itself up so that we don't leak memory if
-// a test exits early.
+// nvclusterlod_Context wrapper handles ownership, lifetime, doesn't leak when
+// tests return etc.
 struct ScopedLodContext
 {
-  nvclusterlod_Context context = nullptr;
-
-  nvclusterlod_Result init(nvcluster_Context baseContext)
+  ScopedLodContext(nvcluster_Context baseContext)
   {
-    assert(!context);
     nvclusterlod_ContextCreateInfo info{.clusterContext = baseContext};
-    return nvclusterlodCreateContext(&info, &context);
+    check(nvclusterlodCreateContext(&info, &context));
   }
-
   ~ScopedLodContext() { std::ignore = nvclusterlodDestroyContext(context); }
+  ScopedLodContext(const ScopedLodContext& other)            = delete;
+  ScopedLodContext& operator=(const ScopedLodContext& other) = delete;
+  operator nvclusterlod_Context() const { return context; }
+  nvclusterlod_Context context = nullptr;
 };
-
 
 // GoogleTest does not offer any nice way to share data between tests. Since the
 // test data takes some time to generate, everything is just in one giant test.
 TEST(Hierarchy, BoundsAndOverlaps)
 {
-  ScopedContext context;
-  ASSERT_EQ(context.init(), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
-  ScopedLodContext lodContext;
-  ASSERT_EQ(lodContext.init(context.context), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
-
+  ScopedContext          context;
+  ScopedLodContext       lodContext(context);
   GeometryMesh           icosphere{makeIcosphere(6)};
   nvclusterlod_MeshInput meshInput{
       .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
       .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
       .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
       .vertexCount      = static_cast<uint32_t>(icosphere.positions.size()),
-      .vertexStride     = sizeof(vec3),
+      .vertexStride     = sizeof(vec3f),
       .clusterConfig =
           {
               .minClusterSize    = 32,  // force clusters of 32 triangles
@@ -530,18 +524,15 @@ TEST(Hierarchy, BoundsAndOverlaps)
 
 TEST(Mesh, VertexLimit)
 {
-  ScopedContext context;
-  ASSERT_EQ(context.init(), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
-  ScopedLodContext lodContext;
-  ASSERT_EQ(lodContext.init(context.context), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
-
+  ScopedContext          context;
+  ScopedLodContext       lodContext(context);
   GeometryMesh           icosphere{makeIcosphere(4)};
   nvclusterlod_MeshInput meshInput{
       .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
       .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
       .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
       .vertexCount      = static_cast<uint32_t>(icosphere.positions.size()),
-      .vertexStride     = sizeof(vec3),
+      .vertexStride     = sizeof(vec3f),
       .clusterConfig =
           {
               .minClusterSize        = 1,
@@ -583,6 +574,64 @@ TEST(Mesh, VertexLimit)
   }
 }
 
+TEST(Mesh, ClusterBoundingSpheresOptional)
+{
+  ScopedContext          context;
+  ScopedLodContext       lodContext(context);
+  GeometryMesh           icosphere{makeIcosphere(2)};
+  nvclusterlod_MeshInput meshInput{
+      .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
+      .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
+      .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
+      .vertexCount      = static_cast<uint32_t>(icosphere.positions.size()),
+      .vertexStride     = sizeof(vec3f),
+      .clusterConfig =
+          {
+              .minClusterSize    = 4,
+              .maxClusterSize    = 32,
+              .costUnderfill     = 0.9f,
+              .costOverlap       = 0.5f,
+              .preSplitThreshold = 1u << 17,
+          },
+      .groupConfig =
+          {
+              .minClusterSize    = 8,
+              .maxClusterSize    = 16,
+              .costUnderfill     = 0.5f,
+              .costOverlap       = 0.0f,
+              .preSplitThreshold = 0,
+          },
+      .decimationFactor = 0.5f,
+  };
+
+  nvclusterlod_MeshCounts counts{};
+  ASSERT_EQ(nvclusterlodGetMeshRequirements(lodContext.context, &meshInput, &counts), nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+
+  std::vector<nvclusterlod_Vec3u> triangleVertices(counts.triangleCount);
+  std::vector<nvcluster_Range>    clusterTriangleRanges(counts.clusterCount);
+  std::vector<uint32_t>           clusterGeneratingGroups(counts.clusterCount);
+  std::vector<float>              groupQuadricErrors(counts.groupCount);
+  std::vector<nvcluster_Range>    groupClusterRanges(counts.groupCount);
+  std::vector<nvcluster_Range>    lodLevelGroupRanges(counts.lodLevelCount);
+
+  nvclusterlod_MeshOutput meshOutput{};
+  meshOutput.triangleVertices        = triangleVertices.data();
+  meshOutput.clusterTriangleRanges   = clusterTriangleRanges.data();
+  meshOutput.clusterGeneratingGroups = clusterGeneratingGroups.data();
+  meshOutput.clusterBoundingSpheres  = nullptr;  // optional output: leave null
+  meshOutput.groupQuadricErrors      = groupQuadricErrors.data();
+  meshOutput.groupClusterRanges      = groupClusterRanges.data();
+  meshOutput.lodLevelGroupRanges     = lodLevelGroupRanges.data();
+  meshOutput.triangleCount           = static_cast<uint32_t>(triangleVertices.size());
+  meshOutput.clusterCount            = static_cast<uint32_t>(clusterTriangleRanges.size());
+  meshOutput.groupCount              = static_cast<uint32_t>(groupClusterRanges.size());
+  meshOutput.lodLevelCount           = static_cast<uint32_t>(lodLevelGroupRanges.size());
+
+  nvclusterlod_Result result = nvclusterlodBuildMesh(lodContext.context, &meshInput, &meshOutput);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+  EXPECT_GT(meshOutput.clusterCount, 0u);
+}
+
 TEST(Hierarchy, AngularError)
 {
   {
@@ -594,8 +643,8 @@ TEST(Hierarchy, AngularError)
   }
 
   // Verify the reverse mapping works for many values
-  std::array<float, 4> fovValues   = {M_PIf * 0.05f, M_PIf * 0.3f, M_PIf * 0.5f, M_PIf * 0.7f};
-  std::array<float, 5> pixelValues = {0.5f, 1.0f, 10.0f, 100.0f, 1000.0f};
+  auto fovValues   = std::to_array({M_PIf * 0.05f, M_PIf * 0.3f, M_PIf * 0.5f, M_PIf * 0.7f});
+  auto pixelValues = std::to_array({0.5f, 1.0f, 10.0f, 100.0f, 1000.0f});
   for(float fov : fovValues)
   {
     for(float errorSize : pixelValues)

@@ -1,14 +1,29 @@
+# Changelog
 
-# Version 2
+## [3]
 
-## Features
+### Added
 
-- Shared library support in cmake, [`NVCLUSTERLOD_BUILDER_SHARED`](CMakeLists.txt)
+- Support `nvclusterlod_ContextCreateInfo::parallelize`.
 
-## Code Quality
+### Changed
 
-- Real C API, removing namespace, adding prefixes, symbol export
-- Triangles now vec3u rather than indices
-- Spheres use vec3f center
-- Removed `vertexOffset`
-- Fallback for missing libc++ parallel execution
+- Modified error enums.
+- Use `std::span` internally.
+
+## [2]
+
+### Added
+
+- Shared library support in CMake (`NVCLUSTERLOD_BUILDER_SHARED`).
+- Fallback for missing libc++ parallel execution.
+
+### Changed
+
+- Real C API, removing namespace, adding prefixes, and symbol export.
+- Triangles now `vec3u` rather than indices.
+- Spheres use `vec3f` center.
+
+### Removed
+
+- `vertexOffset` input parameter.

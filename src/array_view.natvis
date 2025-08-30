@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
-  <Type Name="meshops::ArrayView&lt;*&gt;">
+  <Type Name="ArrayView&lt;*&gt;">
     <DisplayString>{{ size={m_size} }}</DisplayString>
     <Expand>
       <Item Name="[ptr]" >m_ptr</Item>

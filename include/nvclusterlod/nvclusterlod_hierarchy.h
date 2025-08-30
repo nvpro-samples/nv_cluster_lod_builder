@@ -40,8 +40,7 @@ typedef struct nvclusterlod_HierarchyInput
   // the readme for a visuzliation.
   const uint32_t* clusterGeneratingGroups NVCLUSTERLOD_DEFAULT(nullptr);
 
-  // Bounding spheres of the clusters, may be nullptr
-  // TODO: verify 'may be nullptr' - likely doesn't work anymore
+  // Bounding spheres of the clusters
   const nvclusterlod_Sphere* clusterBoundingSpheres NVCLUSTERLOD_DEFAULT(nullptr);
 
   // Error metric after decimating geometry in each group. Counter-intuitively,

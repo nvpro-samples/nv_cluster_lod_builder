@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <nvclusterlod/nvclusterlod_mesh.h>
 #include <span>
 #include <unordered_map>
@@ -175,7 +176,6 @@ inline nvclusterlod_Result generateLocalizedLodMesh(nvclusterlod_Context context
   return generateLocalizedLodMesh(std::move(lodMesh), localizedMesh);
 }
 
-
 // Utility call to build lists of generating groups (that contributed
 // decimated clusters) for each group. This collapses duplicate values in
 // clusterGeneratingGroups for each groupClusterRanges.
@@ -193,20 +193,14 @@ struct GroupGeneratingGroups
   size_t size() const { return ranges.size(); }
 };
 
-
 inline nvclusterlod_Result generateGroupGeneratingGroups(std::span<const nvcluster_Range>     groupClusterRanges,
                                                          std::span<const uint32_t>            clusterGeneratingGroups,
                                                          nvclusterlod::GroupGeneratingGroups& groupGeneratingGroups)
 {
   groupGeneratingGroups.ranges.reserve(groupClusterRanges.size());
 
-  // iterate over all groups and find unique set of generating groups
-  // from its clusters.
-  //
-  // append them linearly
-
-  uint32_t offset = 0;
-
+  // Iterate over all groups, find the unique set of generating groups from
+  // their clusters and append them linearly
   for(size_t groupIndex = 0; groupIndex < groupClusterRanges.size(); groupIndex++)
   {
     const nvcluster_Range& clusterRange = groupClusterRanges[groupIndex];
@@ -215,23 +209,24 @@ inline nvclusterlod_Result generateGroupGeneratingGroups(std::span<const nvclust
       return nvclusterlod_Result::NVCLUSTERLOD_ERROR_EMPTY_CLUSTER_GENERATING_GROUPS;
     }
 
-    std::span<const uint32_t> generatingGroups(clusterGeneratingGroups.data() + clusterRange.offset, clusterRange.count);
+    std::span<const uint32_t> generatingGroups =
+        std::span(clusterGeneratingGroups).subspan(clusterRange.offset, clusterRange.count);
 
     if(generatingGroups[0] == NVCLUSTERLOD_ORIGINAL_MESH_GROUP)
     {
-      groupGeneratingGroups.ranges.push_back({offset, 0});  // LOD0 groups have no generating group
+      groupGeneratingGroups.ranges.push_back({uint32_t(groupGeneratingGroups.groups.size()), 0});  // LOD0 groups have no generating group
     }
     else
     {
       std::unordered_set uniqueGeneratingGroups(generatingGroups.begin(), generatingGroups.end());
-      nvcluster_Range    newGroupRange = {offset, uint32_t(uniqueGeneratingGroups.size())};
+      nvcluster_Range newGroupRange = {uint32_t(groupGeneratingGroups.groups.size()), uint32_t(uniqueGeneratingGroups.size())};
       groupGeneratingGroups.ranges.push_back(newGroupRange);
       groupGeneratingGroups.groups.insert(groupGeneratingGroups.groups.end(), uniqueGeneratingGroups.begin(),
                                           uniqueGeneratingGroups.end());
-
-      offset += newGroupRange.count;
     }
   }
+  assert(groupGeneratingGroups.ranges[0].offset == 0);
+  assert(groupGeneratingGroups.ranges.size() == groupClusterRanges.size());
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
 }  // namespace nvclusterlod

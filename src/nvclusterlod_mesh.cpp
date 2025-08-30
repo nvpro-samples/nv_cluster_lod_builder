@@ -17,9 +17,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// Workaround for libc++ std::execution
-#include "../nv_cluster_builder/src/parallel_execution_libcxx.hpp"
-
 #include <array>
 #include <array_view.hpp>
 #include <cstdint>
@@ -27,16 +24,16 @@
 #include <meshoptimizer.h>
 #include <nvcluster/nvcluster.h>
 #include <nvcluster/nvcluster_storage.hpp>
+#include <nvcluster/util/parallel.hpp>
 #include <nvclusterlod/nvclusterlod_common.h>
 #include <nvclusterlod/nvclusterlod_hierarchy.h>
 #include <nvclusterlod/nvclusterlod_mesh.h>
 #include <nvclusterlod_context.hpp>
-#include <nvclusterlod_parallel.hpp>
-#include <nvclusterlod_util.hpp>
+#include <nvclusterlod_cpp.hpp>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 static constexpr uint32_t NVLOD_MINIMAL_ADJACENCY_SIZE          = 5;
@@ -98,30 +95,8 @@ public:
 
 namespace nvclusterlod {
 
-using vec3  = nvcluster::vec3f;
-using vec3u = nvcluster::vec3u;
-
-static inline nvcluster_AABB emptyAABB()
-{
-  nvcluster_AABB res;
-  res.bboxMin[0] = std::numeric_limits<float>::max();
-  res.bboxMin[1] = std::numeric_limits<float>::max();
-  res.bboxMin[2] = std::numeric_limits<float>::max();
-  res.bboxMax[0] = std::numeric_limits<float>::lowest();
-  res.bboxMax[1] = std::numeric_limits<float>::lowest();
-  res.bboxMax[2] = std::numeric_limits<float>::lowest();
-  return res;
-}
-
-static inline void addAABB(nvcluster_AABB& aabb, const nvcluster_AABB& added)
-{
-  for(uint32_t i = 0; i < 3; i++)
-  {
-    aabb.bboxMin[i] = std::min(aabb.bboxMin[i], added.bboxMin[i]);
-    aabb.bboxMax[i] = std::max(aabb.bboxMax[i], added.bboxMax[i]);
-  }
-}
-
+using nvcluster::vec3f;
+using nvcluster::vec3u;
 
 // Clustered triangles for all groups, hence SegmentedClustering. Each segment
 // is a group from the previous LOD iteration. Within each segment triangles are
@@ -131,15 +106,13 @@ struct TriangleClusters
   nvcluster::SegmentedClusterStorage clustering;
 
   // Bounding boxes for each cluster
-  std::vector<nvcluster_AABB> clusterAabbs;
+  std::vector<nvcluster::AABB> clusterAabbs;
 
   // Triangles are clustered from ranges of input geometry. The initial
   // clustering has one range - the whole mesh. Subsequent ranges come from
   // decimated cluster groups of the previous level. The generating group is
   // implicitly generatingGroupOffset plus the segment index.
   uint32_t generatingGroupOffset;
-
-  uint32_t maxClusterItems;
 };
 
 // Shared vertex counts between triangle clusters. This is used to compute
@@ -169,11 +142,11 @@ struct DecimatedClusterGroups
   // Ranges of triangles. Initially there is just one range containing the input
   // mesh. In subsequent iterations each ranges is a group of decimated
   // triangles. Clusters of triangles are formed within each range.
-  std::vector<nvcluster_Range> groupTriangleRanges;
+  std::vector<nvcluster::Range> groupTriangleRanges;
 
   // Triangle indices and vertices. Triangles are grouped by
   // groupTriangleRanges. Vertices always point to the input mesh vertices.
-  nvclusterlod_MeshInput mesh;
+  MeshInput mesh;
 
   // Storage for decimated triangles from the previous pass. Note that triangles
   // are written to the output in clusters, which are formed from these at the
@@ -193,80 +166,65 @@ struct DecimatedClusterGroups
   std::vector<uint8_t> globalLockedVertices;
 };
 
-
-struct OutputWritePositions
-{
-  uint32_t clusterTriangleRange{0u};
-  uint32_t clusterTriangleVertex{0u};
-  uint32_t clusterParentGroup{0u};
-  uint32_t clusterBoundingSphere{0u};
-  uint32_t groupQuadricError{0u};
-  uint32_t groupCluster{0u};
-  uint32_t lodLevelGroup{0u};
-};
-
 // Find the vertex in the mesh that is the farthest from the start point.
-inline void farthestPoint(const nvclusterlod_MeshInput& mesh, const nvcluster::vec3f& start, nvcluster::vec3f& farthest)
+inline std::optional<nvcluster::vec3f> farthestPoint(const MeshInput& mesh, const nvcluster::vec3f& target)
 {
-  const nvcluster_Vec3f* result = nullptr;
-
-  float maxLengthSq = 0.0f;
+  const nvcluster::vec3f* result      = nullptr;
+  float                   maxLengthSq = -1.0f;
 
   // Iterate over triangles, paying the cost of visiting duplicate vertices so
   // that unused vertices are not included.
-  for(uint32_t triangleIndex = 0; triangleIndex < mesh.triangleCount; triangleIndex++)
+  for(size_t triangleIndex = 0; triangleIndex < mesh.triangleVertices.size(); triangleIndex++)
   {
-    nvcluster::vec3u triangle = fromAPI(mesh.triangleVertices[triangleIndex]);
+    nvcluster::vec3u triangle = mesh.triangleVertices[triangleIndex];
     for(size_t i = 0; i < 3; ++i)
     {
-      const nvcluster_Vec3f* candidatePtr = &ArrayView(mesh.vertexPositions, mesh.vertexCount, mesh.vertexStride)[triangle[i]];
-      float lengthSq = nvcluster::length_squared(fromAPI(*candidatePtr) - start);
+      const nvcluster::vec3f& candidate = mesh.vertexPositions[triangle[i]];
+      float                   lengthSq  = nvcluster::length_squared(candidate - target);
       if(lengthSq > maxLengthSq)
       {
         maxLengthSq = lengthSq;
-        result      = candidatePtr;
+        result      = &candidate;
       }
     }
   }
 
-  if(result != nullptr)
-  {
-    farthest = fromAPI(*result);
-  }
+  return result ? std::optional<nvcluster::vec3f>(*result) : std::nullopt;
 };
 
 // Ritter's bounding sphere algorithm
 // https://en.wikipedia.org/wiki/Bounding_sphere
-static nvclusterlod_Result makeBoundingSphere(const nvclusterlod_MeshInput& mesh, nvclusterlod_Sphere& sphere)
+inline nvclusterlod_Result makeBoundingSphere(const MeshInput& mesh, nvclusterlod::Sphere& sphere)
 {
-  // TODO: try https://github.com/hbf/miniball
-  const nvcluster::vec3f x = fromAPI(ArrayView(mesh.vertexPositions, mesh.vertexCount, mesh.vertexStride)[0]);
-
-  nvcluster::vec3f y = {}, z = {};
-
-  farthestPoint(mesh, x, y);
-  farthestPoint(mesh, y, z);
-
-  nvcluster::vec3f position = (y + z) * 0.5f;
-  float            radius   = nvcluster::length(z - y) * 0.5f;
-
-  nvcluster::vec3f f = {};
-  farthestPoint(mesh, position, f);
-  radius = nvcluster::length(f - position);
-  if(std::isnan(position[0]) || std::isnan(position[1]) || std::isnan(position[2]) || std::isnan(radius))
+  if(mesh.triangleVertices.empty())
   {
-    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_INCONSISTENT_BOUNDING_SPHERES;
+    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_MAKE_BOUNDING_SPHERES_FROM_EMPTY_SET;
   }
 
-  sphere.center = toAPI(position);
-  sphere.radius = radius;
+  // TODO: try https://github.com/hbf/miniball
+  const nvcluster::vec3f x = mesh.vertexPositions[mesh.triangleVertices[0][0]];
 
+  nvcluster::vec3f y = *farthestPoint(mesh, x);
+  nvcluster::vec3f z = *farthestPoint(mesh, y);
+
+  Sphere result{(y + z) * 0.5f, nvcluster::length(z - y) * 0.5f};
+
+  nvcluster::vec3f f = *farthestPoint(mesh, result.center);
+  result.radius      = nvcluster::length(f - result.center);
+  result.radius      = std::nextafter(result.radius, std::numeric_limits<float>::max());
+  if(std::isnan(result.center[0]) || std::isnan(result.center[1]) || std::isnan(result.center[2]) || std::isnan(result.radius))
+  {
+    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_PRODUCED_NAN_BOUNDING_SPHERES;
+  }
+
+  sphere = result;
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
 
 // From a triangle mesh and a partition of its triangles into a number of triangle ranges (DecimatedClusterGroups::groupTriangleRanges), generate a number of clusters within each range
 // according to the requested clusterConfig.
-static nvclusterlod_Result generateTriangleClusters(nvclusterlod_Context          context,
+template <bool Parallelize>
+static nvclusterlod_Result generateTriangleClusters(nvcluster_Context             context,
                                                     const DecimatedClusterGroups& decimatedClusterGroups,
                                                     const nvcluster_Config&       clusterConfig,
                                                     TriangleClusters&             output)
@@ -274,76 +232,66 @@ static nvclusterlod_Result generateTriangleClusters(nvclusterlod_Context        
   Stopwatch sw(__func__);
 
   // Compute the bounding boxes and centroids for each triangle
-  uint32_t                     triangleCount = decimatedClusterGroups.mesh.triangleCount;
-  std::vector<nvcluster_AABB>  triangleAabbs(triangleCount);
-  std::vector<vec3>            triangleCentroids(triangleCount);
+  size_t                       triangleCount = decimatedClusterGroups.mesh.triangleVertices.size();
+  std::vector<nvcluster::AABB> triangleAabbs(triangleCount);
+  std::vector<vec3f>           triangleCentroids(triangleCount);
 
-  NVLOD_PARALLEL_FOR_BEGIN(i, triangleCount, 2048)
-  {
+  parallel_batches<Parallelize, 2048>(triangleCount, [&](uint64_t i) {
     using namespace nvcluster;
-    ArrayView   positions(decimatedClusterGroups.mesh.vertexPositions, decimatedClusterGroups.mesh.vertexCount,
-                          decimatedClusterGroups.mesh.vertexStride);
-    const vec3u triangle = fromAPI(decimatedClusterGroups.mesh.triangleVertices[i]);
-    const vec3f a        = fromAPI(positions[triangle[0]]);
-    const vec3f b        = fromAPI(positions[triangle[1]]);
-    const vec3f c        = fromAPI(positions[triangle[2]]);
-    AABB&       aabb     = reinterpret_cast<AABB&>(triangleAabbs[i]);
-    aabb.min             = min(a, min(b, c));
-    aabb.max             = max(a, max(b, c));
+    const vec3u triangle = decimatedClusterGroups.mesh.triangleVertices[i];
+    const vec3f a        = decimatedClusterGroups.mesh.vertexPositions[triangle[0]];
+    const vec3f b        = decimatedClusterGroups.mesh.vertexPositions[triangle[1]];
+    const vec3f c        = decimatedClusterGroups.mesh.vertexPositions[triangle[2]];
+    triangleAabbs[i]     = {min(a, min(b, c)), max(a, max(b, c))};
 
 #if 1
-    triangleCentroids[i] = aabb.center();
+    triangleCentroids[i] = triangleAabbs[i].center();
 #else
     triangleCentroids[i] = (a + b + c) / 3.0f;
 #endif
-  }
-  NVLOD_PARALLEL_FOR_END;
+  });
 
   // The triangles are now only considered as bounding boxes with a centroid. The segment clusterizer will then
   // generate a number of clusters (each defined by a range in the array of input elements) within each input range (segment)
   // according to the requested clustering configuration.
   nvcluster_Input perTriangleElements{
-      .itemBoundingBoxes = triangleAabbs.data(),
+      .itemBoundingBoxes = reinterpret_cast<const nvcluster_AABB*>(triangleAabbs.data()),
       .itemCentroids     = reinterpret_cast<const nvcluster_Vec3f*>(triangleCentroids.data()),
       .itemCount         = uint32_t(triangleAabbs.size()),
       .itemVertices      = clusterConfig.maxClusterVertices != ~0u ?
-                               reinterpret_cast<const uint32_t*>(decimatedClusterGroups.mesh.triangleVertices) :
+                               reinterpret_cast<const uint32_t*>(decimatedClusterGroups.mesh.triangleVertices.data()) :
                                nullptr,
-      .vertexCount       = clusterConfig.maxClusterVertices != ~0u ? decimatedClusterGroups.mesh.vertexCount : 0u};
+      .vertexCount = clusterConfig.maxClusterVertices != ~0u ? uint32_t(decimatedClusterGroups.mesh.vertexPositions.size()) : 0u};
 
-  nvcluster_Result clusteringResult =
-      nvcluster::generateSegmentedClusters(context->clusterContext, clusterConfig, perTriangleElements,
-                                           nvcluster_Segments{decimatedClusterGroups.groupTriangleRanges.data(),
-                                                              uint32_t(decimatedClusterGroups.groupTriangleRanges.size())},
-                                           output.clustering);
+  nvcluster_Result clusteringResult = nvcluster::generateSegmentedClusters(
+      context, clusterConfig, perTriangleElements,
+      nvcluster_Segments{reinterpret_cast<const nvcluster_Range*>(decimatedClusterGroups.groupTriangleRanges.data()),
+                         uint32_t(decimatedClusterGroups.groupTriangleRanges.size())},
+      output.clustering);
   if(clusteringResult != nvcluster_Result::NVCLUSTER_SUCCESS)
   {
-    // FIXME: could translate the clustering error for more details
-    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_FAILED;
+    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_TRIANGLES_FAILED;
   }
 
   // For each generated cluster, compute its bounding box so the boxes can be used as input for potential further clustering
   output.clusterAabbs.resize(output.clustering.clusterItemRanges.size());
-  NVLOD_PARALLEL_FOR_BEGIN(rangeIndex, output.clusterAabbs.size(), 512)
-  {
+  parallel_batches<Parallelize, 512>(output.clusterAabbs.size(), [&](uint64_t rangeIndex) {
     const nvcluster_Range& range = output.clustering.clusterItemRanges[rangeIndex];
 
-    nvcluster_AABB clusterAabb = emptyAABB();
+    nvcluster::AABB clusterAabb = nvcluster::AABB();
 
     for(uint32_t index = range.offset; index < range.offset + range.count; index++)
     {
       uint32_t triangleIndex = output.clustering.items[index];
-      addAABB(clusterAabb, triangleAabbs[triangleIndex]);
+      clusterAabb += triangleAabbs[triangleIndex];
     }
     output.clusterAabbs[rangeIndex] = clusterAabb;
-  }
-  NVLOD_PARALLEL_FOR_END;
+  });
 
-  // Store the cluster group index that was used to generate the clusters.
-  // FIXME: where is that used?
+  // Store the cluster group index that was used to generate the clusters. This
+  // is needed to add to the cluster group indices, which start at zero in each
+  // LOD level.
   output.generatingGroupOffset = decimatedClusterGroups.baseClusterGroupIndex;
-  // Store the largest allowed cluster size in the output
-  output.maxClusterItems = clusterConfig.maxClusterSize;
 
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
@@ -352,6 +300,7 @@ static nvclusterlod_Result generateTriangleClusters(nvclusterlod_Context        
 // locked vertices internal to each group (i.e. not on group borders). This is
 // important for quality of the recursive decimation.
 // This function also sanitizes the cluster adjacency by removing connections involving less than NVLOD_MINIMAL_ADJACENCY_SIZE vertices.
+template <bool Parallelize>
 static nvclusterlod_Result groupClusters(nvcluster_Context       context,
                                          const TriangleClusters& triangleClusters,
                                          const nvcluster_Config& clusterGroupConfig,
@@ -367,8 +316,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
   std::vector<uint32_t> adjacencySizes(clusterAdjacency.size(), 0);
   {
     //Stopwatch sw("cleanup");
-    NVLOD_PARALLEL_FOR_BEGIN(i, clusterAdjacency.size(), 512)
-    {
+    parallel_batches<Parallelize, 512>(clusterAdjacency.size(), [&](uint64_t i) {
       AdjacentCounts& adjacency = clusterAdjacency[i];
       for(auto it = adjacency.begin(); it != adjacency.end();)
       {
@@ -382,8 +330,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
         }
       }
       adjacencySizes[i] = uint32_t(adjacency.size());
-    }
-    NVLOD_PARALLEL_FOR_END;
+    });
   }
 
   std::vector<uint32_t> adjacencyOffsets(clusterAdjacency.size(), 0);
@@ -392,8 +339,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
     // Get the size of the adjacency list for each cluster (i.e. the number of clusters adjacent to it), and compute the prefix sum of those sizes into adjacencyOffsets.
     // Those offsets will later be used to linearize the adjacency data for the clusters and pass it along for further clustering
     // Note: do NOT use NVLOD_DEFAULT_EXECUTION_POLICY as exclusive_scan seems not to be guaranteed to work in parallel
-    std::exclusive_scan(std::execution::seq, adjacencySizes.begin(), adjacencySizes.end(), adjacencyOffsets.begin(), 0,
-                        std::plus<uint32_t>());
+    std::exclusive_scan(adjacencySizes.begin(), adjacencySizes.end(), adjacencyOffsets.begin(), 0, std::plus<uint32_t>());
   }
 
   // Fill adjacency for clustering input
@@ -409,16 +355,15 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
   // Allocate the buffer storing the ranges within the linearized adjacency buffer corresponding to each cluster
   std::vector<nvcluster_Range> adjacencyRanges(adjacencyOffsets.size());
 
-  std::vector<vec3> clusterCentroids(triangleClusters.clusterAabbs.size());
+  std::vector<vec3f> clusterCentroids(triangleClusters.clusterAabbs.size());
   // For each cluster, write the adjacency data to the linearized buffer and store the corresponding range for the cluster within that adjacency data
   // and compute cluster centroids as the centroid of their AABBs
   {
     //Stopwatch sw("adj");
-    NVLOD_PARALLEL_FOR_BEGIN(clusterIndex, adjacencyOffsets.size(), 512)
-    {
+    parallel_batches<Parallelize, 512>(adjacencyOffsets.size(), [&](uint64_t clusterIndex) {
       // Initialize the adjacency range with the offset for the cluster, leaving the count to zero and incrementing below
-      nvcluster_Range& range  = adjacencyRanges[clusterIndex];
-      range                   = {adjacencyOffsets[clusterIndex], 0};
+      nvcluster_Range& range = adjacencyRanges[clusterIndex];
+      range                  = {adjacencyOffsets[clusterIndex], 0};
 
       // Compute the weight of the connection to each adjacent cluster and write the adjacent clusters indices and weights within the range
       for(const auto& [adjacentClusterIndex, adjacencyVertexCounts] : clusterAdjacency[clusterIndex])
@@ -434,10 +379,9 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
         // Increment the write position within the range
         range.count++;
       }
-      const nvcluster::AABB& clusterAabb = reinterpret_cast<const nvcluster::AABB&>(triangleClusters.clusterAabbs[clusterIndex]);
+      const nvcluster::AABB& clusterAabb = triangleClusters.clusterAabbs[clusterIndex];
       clusterCentroids[clusterIndex] = clusterAabb.center();
-    }
-    NVLOD_PARALLEL_FOR_END;
+    });
   }
   // Generate input data for the clusterizer, where the elements to clusterize are the input clusters.
   // We also provide the adjacency data and weights for the clusters to drive the clusterizer, that will
@@ -445,7 +389,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
   // vertices between clusters, the clusterizer will tend to minimize the cost of the graph cuts, hence
   // grouping clusters with more shared vertices.
   nvcluster_Input clusteringInput{
-      .itemBoundingBoxes     = triangleClusters.clusterAabbs.data(),
+      .itemBoundingBoxes     = reinterpret_cast<const nvcluster_AABB*>(triangleClusters.clusterAabbs.data()),
       .itemCentroids         = reinterpret_cast<const nvcluster_Vec3f*>(clusterCentroids.data()),
       .itemCount             = uint32_t(triangleClusters.clusterAabbs.size()),
       .itemConnectionRanges  = adjacencyRanges.data(),
@@ -466,7 +410,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
   }
   if(clusterResult != nvcluster_Result::NVCLUSTER_SUCCESS)
   {
-    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_FAILED;
+    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_TRIANGLES_FAILED;
   }
 
   // Compute the total triangle count for each group of clusters of triangles
@@ -491,20 +435,18 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
 static nvclusterlod_Result writeClusters(const DecimatedClusterGroups& decimatedClusterGroups,
                                          ClusterGroups&                clusterGroups,
                                          TriangleClusters&             triangleClusters,
-                                         nvclusterlod_MeshOutput&      meshOutput,
-                                         OutputWritePositions&         outputWritePositions)
+                                         MeshOutput&                   meshOutput)
 {
   Stopwatch sw(__func__);
 
-  if(outputWritePositions.lodLevelGroup >= meshOutput.lodLevelCount)
+  if(meshOutput.lodLevelGroupRanges.full())
   {
     return nvclusterlod_Result::NVCLUSTERLOD_ERROR_OUTPUT_MESH_OVERFLOW;
   }
 
   // Fetch the range of groups for the current LOD level in the output mesh and set its start offset after the last written group count
-  nvcluster_Range& lodLevelGroupRange = meshOutput.lodLevelGroupRanges[outputWritePositions.lodLevelGroup];
-  outputWritePositions.lodLevelGroup++;
-  lodLevelGroupRange.offset = outputWritePositions.groupCluster;
+  nvcluster::Range& lodLevelGroupRange = meshOutput.lodLevelGroupRanges.allocate();
+  lodLevelGroupRange.offset            = meshOutput.groupClusterRanges.allocatedCount();
 
   // Triangle clusters are stored in ranges of the generating group, before
   // decimation. Now that we have re-grouped the triangle clusters into cluster
@@ -521,26 +463,19 @@ static nvclusterlod_Result writeClusters(const DecimatedClusterGroups& decimated
     uint32_t generatingGroupIndex = triangleClusters.generatingGroupOffset + uint32_t(clusterLocalGroupIndex);
     clusterGeneratingGroups.insert(clusterGeneratingGroups.end(), clusterGroupRange.count, generatingGroupIndex);
   }
-
-  if(clusterGeneratingGroups.size() != triangleClusters.clustering.clusterItemRanges.size())
-  {
-    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTER_GENERATING_GROUPS_MISMATCH;
-  }
+  assert(clusterGeneratingGroups.size() == triangleClusters.clustering.clusterItemRanges.size());
 
   // Write the clusters to the output
   for(size_t clusterGroupIndex = 0; clusterGroupIndex < clusterGroups.groups.clusterItemRanges.size(); ++clusterGroupIndex)
   {
-    // FIXME: check that value
-    //if(outputWritePositions.groupCluster >= meshOutput.groupClusterRangeCount)
-    if(outputWritePositions.groupCluster >= meshOutput.groupCount)
+    if(meshOutput.groupClusterRanges.full())
 
     {
       return nvclusterlod_Result::NVCLUSTERLOD_ERROR_OUTPUT_MESH_OVERFLOW;
     }
     const nvcluster_Range& range = clusterGroups.groups.clusterItemRanges[clusterGroupIndex];
     std::span<uint32_t> clusterGroup = std::span<uint32_t>(clusterGroups.groups.items.data() + range.offset, range.count);
-    meshOutput.groupClusterRanges[outputWritePositions.groupCluster] = {outputWritePositions.clusterTriangleRange, range.count};
-    outputWritePositions.groupCluster++;
+    meshOutput.groupClusterRanges.append({meshOutput.clusterTriangleRanges.allocatedCount(), range.count});
 
 
     // Sort the clusters by their generating group. Clusters are selected based
@@ -562,62 +497,44 @@ static nvclusterlod_Result writeClusters(const DecimatedClusterGroups& decimated
 
     for(const uint32_t& clusterIndex : clusterGroup)
     {
-      nvcluster_Range           clusterTriangleRange = triangleClusters.clustering.clusterItemRanges[clusterIndex];
+      const nvcluster_Range&    clusterTriangleRange = triangleClusters.clustering.clusterItemRanges[clusterIndex];
       std::span<const uint32_t> clusterTriangles =
-          std::span<uint32_t>(triangleClusters.clustering.items.data() + clusterTriangleRange.offset,
-                              clusterTriangleRange.count);
+          std::span(triangleClusters.clustering.items).subspan(clusterTriangleRange.offset, clusterTriangleRange.count);
 
-      const nvclusterlod_Vec3u* trianglesBegin = meshOutput.triangleVertices + outputWritePositions.clusterTriangleVertex;
+      uint32_t trianglesBeginIndex = meshOutput.triangleVertices.allocatedCount();
 
-      uint32_t trianglesBeginIndex = outputWritePositions.clusterTriangleVertex;
-
-      nvcluster_Range clusterRange = {outputWritePositions.clusterTriangleVertex, uint32_t(clusterTriangles.size())};
-      if(clusterRange.offset + clusterRange.count > meshOutput.triangleCount)
+      nvcluster::Range clusterRange = {meshOutput.triangleVertices.allocatedCount(), uint32_t(clusterTriangles.size())};
+      if(clusterRange.offset + clusterRange.count > meshOutput.triangleVertices.capacity())
       {
         return nvclusterlod_Result::NVCLUSTERLOD_ERROR_OUTPUT_MESH_OVERFLOW;
       }
-
-      // FIXME: reinstate that one
-      //assert(outputCounters.clusterTriangleRangeCount < meshOutput.clusterTriangleRangeCount);
 
       // Gather and write triangles for the cluster. Note these are still global
       // triangle vertex indices. Creating cluster vertices with a vertex cache
       // is intended to be done afterwards.
       for(const uint32_t& triangleIndex : clusterTriangles)
       {
-        const nvclusterlod_Vec3u& triangle = decimatedClusterGroups.mesh.triangleVertices[triangleIndex];
-        meshOutput.triangleVertices[outputWritePositions.clusterTriangleVertex] = triangle;
-        outputWritePositions.clusterTriangleVertex++;
+        const nvcluster::vec3u& triangle = decimatedClusterGroups.mesh.triangleVertices[triangleIndex];
+        meshOutput.triangleVertices.append(triangle);
       }
 
-      meshOutput.clusterTriangleRanges[outputWritePositions.clusterTriangleRange] = clusterRange;
-      outputWritePositions.clusterTriangleRange++;
-
-      meshOutput.clusterGeneratingGroups[outputWritePositions.clusterParentGroup] = clusterGeneratingGroups[clusterIndex];
-      outputWritePositions.clusterParentGroup++;
+      meshOutput.clusterTriangleRanges.append(clusterRange);
+      meshOutput.clusterGeneratingGroups.append(clusterGeneratingGroups[clusterIndex]);
 
       // Bounding spheres are an optional output
-      if(outputWritePositions.clusterBoundingSphere < meshOutput.clusterCount)
+      if(meshOutput.clusterBoundingSpheres.capacity())
       {
-        nvclusterlod_MeshInput mesh{
-            .triangleVertices = trianglesBegin,
-            .triangleCount    = outputWritePositions.clusterTriangleVertex - trianglesBeginIndex,
-            .vertexPositions  = decimatedClusterGroups.mesh.vertexPositions,
-            .vertexCount      = decimatedClusterGroups.mesh.vertexCount,
-            .vertexStride     = decimatedClusterGroups.mesh.vertexStride,
-        };
-
-        nvclusterlod_Result result =
-            makeBoundingSphere(mesh, meshOutput.clusterBoundingSpheres[outputWritePositions.clusterBoundingSphere]);
+        // Compute bounding spheres for just the triangles in the current cluster
+        MeshInput mesh{meshOutput.triangleVertices.allocated().subspan(trianglesBeginIndex), decimatedClusterGroups.mesh.vertexPositions};
+        nvclusterlod_Result result = makeBoundingSphere(mesh, meshOutput.clusterBoundingSpheres.allocate());
         if(result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
         {
           return result;
         }
-        outputWritePositions.clusterBoundingSphere++;
       }
     }
   }
-  lodLevelGroupRange.count = outputWritePositions.groupCluster - lodLevelGroupRange.offset;
+  lodLevelGroupRange.count = meshOutput.groupClusterRanges.allocatedCount() - lodLevelGroupRange.offset;
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
 
@@ -643,7 +560,7 @@ static nvclusterlod_Result computeClusterAdjacency(const DecimatedClusterGroups&
   // TODO: reduce vertexAdjacency size? overallocated for all vertices in mesh even after decimation
 
   // For each vertex in the input mesh, we store up to 8 adjacent clusters
-  std::vector<VertexAdjacency> vertexClusterAdjacencies(decimatedClusterGroups.mesh.vertexCount);
+  std::vector<VertexAdjacency> vertexClusterAdjacencies(decimatedClusterGroups.mesh.vertexPositions.size());
 
   // For each triangle cluster, add its cluster index to the adjacency lists of the vertices of the triangles contained in the cluster
   // Each time a vertex is found to be adjacent to another cluster we add the current (resp. other) cluster to the adjacency list of the other (resp. current) cluster,
@@ -662,7 +579,7 @@ static nvclusterlod_Result computeClusterAdjacency(const DecimatedClusterGroups&
     {
       // Fetch the current triangle in the cluster
       uint32_t        triangleIndex = clusterTriangles[indexInCluster];
-      const vec3u&    tri           = fromAPI(decimatedClusterGroups.mesh.triangleVertices[triangleIndex]);
+      const vec3u&    tri           = decimatedClusterGroups.mesh.triangleVertices[triangleIndex];
 
       // For each vertex of the triangle, add the current cluster index in its adjacency list
       for(uint32_t i = 0; i < 3; ++i)
@@ -702,10 +619,7 @@ static nvclusterlod_Result computeClusterAdjacency(const DecimatedClusterGroups&
           // The adjacentIndex is a cluster index, different to the current one,
           // that was previously added and thus is a new connection. Append
           // found connection, once for each direction, and increment the vertex counts for each
-          if(adjacentClusterIndex >= clusterIndex)
-          {
-            return nvclusterlod_Result::NVCLUSTERLOD_ERROR_ADJACENCY_GENERATION_FAILED;
-          }
+          assert(adjacentClusterIndex < clusterIndex);
           AdjacencyVertexCount& currentToAdjacent = result[clusterIndex][adjacentClusterIndex];
           AdjacencyVertexCount& adjacentToCurrent = result[adjacentClusterIndex][clusterIndex];
           currentToAdjacent.vertexCount += 1;
@@ -725,15 +639,15 @@ static nvclusterlod_Result computeClusterAdjacency(const DecimatedClusterGroups&
 // Returns a vector of per-vertex boolean uint8_t values indicating which
 // vertices are shared between clusters. Must be uint8_t because that's what
 // meshoptimizer takes.
-static std::vector<uint8_t> computeLockedVertices(const nvclusterlod_MeshInput& inputMesh,
-                                                  const TriangleClusters&       triangleClusters,
-                                                  const ClusterGroups&          clusterGrouping)
+static std::vector<uint8_t> computeLockedVertices(const MeshInput&        inputMesh,
+                                                  const TriangleClusters& triangleClusters,
+                                                  const ClusterGroups&    clusterGrouping)
 {
   Stopwatch                sw(__func__);
   constexpr const uint32_t VERTEX_NOT_SEEN = 0xffffffff;
   constexpr const uint32_t VERTEX_ADDED    = 0xfffffffe;
-  std::vector<uint8_t>     lockedVertices(inputMesh.vertexCount, 0);
-  std::vector<uint32_t>    vertexClusterGroups(inputMesh.vertexCount, VERTEX_NOT_SEEN);
+  std::vector<uint8_t>     lockedVertices(inputMesh.vertexPositions.size(), 0);
+  std::vector<uint32_t>    vertexClusterGroups(inputMesh.vertexPositions.size(), VERTEX_NOT_SEEN);
   for(uint32_t clusterGroupIndex = 0; clusterGroupIndex < uint32_t(clusterGrouping.groups.clusterItemRanges.size()); ++clusterGroupIndex)
   {
     const nvcluster_Range&    range = clusterGrouping.groups.clusterItemRanges[clusterGroupIndex];
@@ -746,7 +660,7 @@ static std::vector<uint8_t> computeLockedVertices(const nvclusterlod_MeshInput& 
           std::span<const uint32_t>(triangleClusters.clustering.items.data() + clusterRange.offset, clusterRange.count);
       for(const uint32_t& triangleIndex : cluster)
       {
-        const vec3u& tri = fromAPI(inputMesh.triangleVertices[triangleIndex]);
+        const vec3u& tri = inputMesh.triangleVertices[triangleIndex];
         for(size_t i = 0; i < 3; ++i)
         {
           uint32_t  vertexIndex        = tri[i];
@@ -775,33 +689,26 @@ static std::vector<uint8_t> computeLockedVertices(const nvclusterlod_MeshInput& 
 
 // Returns groups of triangle after decimating groups of clusters. These
 // triangles will be regrouped into new clusters within their current group.
+template <bool Parallelize>
 static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current,
                                                  const TriangleClusters& triangleClusters,
                                                  const ClusterGroups&    clusterGrouping,
+                                                 uint32_t                maxTrianglesPerCluster,
                                                  float                   lodLevelDecimationFactor)
 {
-  Stopwatch                      sw(__func__);
-  const nvclusterlod_MeshInput&  inputMesh = current.mesh;
-  DecimatedClusterGroups         result;
+  Stopwatch              sw(__func__);
+  const MeshInput&       inputMesh = current.mesh;
+  DecimatedClusterGroups result;
   // Compute vertices shared between cluster groups. These will be locked during
   // decimation.
   result.globalLockedVertices = computeLockedVertices(inputMesh, triangleClusters, clusterGrouping);
-  //FIXME: rethink how DecimatedClusterGroups and InputMesh interact. There must be a way to update the ref to DecimatedClusterGroup
-  //bool useOriginalIndices = result.decimatedTriangleStorage.empty();
-
   result.decimatedTriangleStorage.resize(clusterGrouping.totalTriangleCount);  // space for worst case
-  //if (!useOriginalIndices)
-  {
-    result.mesh.triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(result.decimatedTriangleStorage.data());
-  }
-
   result.groupTriangleRanges.resize(clusterGrouping.groups.clusterItemRanges.size());
   result.groupQuadricErrors.resize(clusterGrouping.groups.clusterItemRanges.size());
   result.baseClusterGroupIndex                 = clusterGrouping.globalGroupOffset;
   std::atomic<uint32_t> decimatedTriangleAlloc = 0;
-  nvclusterlod_Result   success                = nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
-  NVLOD_PARALLEL_FOR_BEGIN(clusterGroupIndex, clusterGrouping.groups.clusterItemRanges.size(), 1)
-  {
+  std::atomic<nvclusterlod_Result> success                = nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  parallel_batches<Parallelize, 1>(clusterGrouping.groups.clusterItemRanges.size(), [&](uint64_t clusterGroupIndex) {
     // The cluster group is formed by non-contiguous clusters but the decimator
     // expects contiguous triangle vertex indices. We could reorder triangles by
     // their cluster group, but that would mean reordering the original geometry
@@ -809,12 +716,12 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
 
     if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
-      NVLOD_PARALLEL_FOR_BREAK;
+      return;
     }
 
     const nvcluster_Range&           clusterGroupRange = clusterGrouping.groups.clusterItemRanges[clusterGroupIndex];
     std::vector<vec3u>               clusterGroupTriangleVertices;
-    clusterGroupTriangleVertices.reserve(clusterGroupRange.count * triangleClusters.maxClusterItems);
+    clusterGroupTriangleVertices.reserve(clusterGroupRange.count * maxTrianglesPerCluster);
     for(uint32_t indexInRange = clusterGroupRange.offset;
         indexInRange < clusterGroupRange.offset + clusterGroupRange.count; indexInRange++)
     {
@@ -824,24 +731,25 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
       {
         uint32_t triangleIndex = triangleClusters.clustering.items[index];
 
-        const vec3u& tri = fromAPI(inputMesh.triangleVertices[triangleIndex]);
+        const vec3u& tri = inputMesh.triangleVertices[triangleIndex];
         clusterGroupTriangleVertices.push_back(tri);
       }
     }
 
     // Decimate the cluster group
-    std::vector<vec3u>               decimatedTriangleVertices(clusterGroupTriangleVertices.size());
-    constexpr float                  targetError   = std::numeric_limits<float>::max();
-    float                            absoluteError = 0.0f;
+    std::vector<vec3u> decimatedTriangleVertices(clusterGroupTriangleVertices.size());
+    constexpr float    targetError   = std::numeric_limits<float>::max();
+    float              absoluteError = 0.0f;
     unsigned int options = meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute;  // no meshopt_SimplifyLockBorder as we only care about vertices shared between cluster groups
     size_t desiredTriangleCount = size_t(float(clusterGroupTriangleVertices.size()) * lodLevelDecimationFactor);
     size_t simplifiedTriangleCount =
         meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
                                        reinterpret_cast<const unsigned int*>(clusterGroupTriangleVertices.data()),
                                        clusterGroupTriangleVertices.size() * 3,
-                                       reinterpret_cast<const float*>(inputMesh.vertexPositions), inputMesh.vertexCount,
-                                       inputMesh.vertexStride, nullptr, 0, nullptr, 0, result.globalLockedVertices.data(),
-                                       desiredTriangleCount * 3, targetError, options, &absoluteError)
+                                       reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                       inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(), nullptr, 0,
+                                       nullptr, 0, result.globalLockedVertices.data(), desiredTriangleCount * 3,
+                                       targetError, options, &absoluteError)
         / 3;
 
     if(desiredTriangleCount < simplifiedTriangleCount)
@@ -851,15 +759,16 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
       meshopt_generateShadowIndexBuffer(reinterpret_cast<unsigned int*>(positionUniqueTriangleVertices.data()),
                                         reinterpret_cast<const unsigned int*>(clusterGroupTriangleVertices.data()),
                                         clusterGroupTriangleVertices.size() * 3,
-                                        reinterpret_cast<const float*>(inputMesh.vertexPositions),
-                                        inputMesh.vertexCount, inputMesh.vertexStride, inputMesh.vertexStride);
+                                        reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                        inputMesh.vertexPositions.size(), sizeof(vec3f), inputMesh.vertexPositions.stride());
       simplifiedTriangleCount =
           meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
                                          reinterpret_cast<const unsigned int*>(positionUniqueTriangleVertices.data()),
                                          positionUniqueTriangleVertices.size() * 3,
-                                         reinterpret_cast<const float*>(inputMesh.vertexPositions), inputMesh.vertexCount,
-                                         inputMesh.vertexStride, nullptr, 0, nullptr, 0, result.globalLockedVertices.data(),
-                                         desiredTriangleCount * 3, targetError, options, &absoluteError)
+                                         reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                         inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(), nullptr,
+                                         0, nullptr, 0, result.globalLockedVertices.data(), desiredTriangleCount * 3,
+                                         targetError, options, &absoluteError)
           / 3;
       if(desiredTriangleCount < simplifiedTriangleCount)
       {
@@ -868,8 +777,9 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
             meshopt_simplifySloppy(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
                                    reinterpret_cast<const unsigned int*>(positionUniqueTriangleVertices.data()),
                                    positionUniqueTriangleVertices.size() * 3,
-                                   reinterpret_cast<const float*>(inputMesh.vertexPositions), inputMesh.vertexCount,
-                                   inputMesh.vertexStride, desiredTriangleCount * 3, targetError, &absoluteError)
+                                   reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                   inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(),
+                                   desiredTriangleCount * 3, targetError, &absoluteError)
             / 3;
       }
     }
@@ -915,15 +825,14 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
     if(groupDecimatedTrianglesOffset + decimatedTriangleVertices.size() > result.decimatedTriangleStorage.size())
     {
       success = nvclusterlod_Result::NVCLUSTERLOD_ERROR_OUTPUT_MESH_OVERFLOW;
-      NVLOD_PARALLEL_FOR_BREAK;
+      return;
     }
     std::ranges::copy(decimatedTriangleVertices, result.decimatedTriangleStorage.begin() + groupDecimatedTrianglesOffset);
 
     result.groupTriangleRanges[clusterGroupIndex] = {uint32_t(groupDecimatedTrianglesOffset),
                                                      uint32_t(decimatedTriangleVertices.size())};
     result.groupQuadricErrors[clusterGroupIndex]  = absoluteError;
-  }
-  NVLOD_PARALLEL_FOR_END;
+  });
 
   if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
   {
@@ -931,16 +840,11 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
   }
 
   result.decimatedTriangleStorage.resize(decimatedTriangleAlloc);
-  result.mesh.triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(result.decimatedTriangleStorage.data());
-  result.mesh.triangleCount    = uint32_t(result.decimatedTriangleStorage.size());
-  result.mesh.vertexCount      = inputMesh.vertexCount;
-  result.mesh.vertexStride = inputMesh.vertexStride;
-  result.mesh.vertexPositions  = inputMesh.vertexPositions;
+  result.mesh = {result.decimatedTriangleStorage, inputMesh.vertexPositions};
 
   std::swap(current, result);
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
-}  // namespace nvclusterlod
 
 // Returns the ceiling of an integer division.
 static uint32_t divCeil(const uint32_t& a, const uint32_t& b)
@@ -948,13 +852,15 @@ static uint32_t divCeil(const uint32_t& a, const uint32_t& b)
   return (a + b - 1) / b;
 }
 
-nvclusterlod_Result nvclusterlodGetMeshRequirements(nvclusterlod_Context /*context*/,
-                                                    const nvclusterlod_MeshInput* input,
-                                                    nvclusterlod_MeshCounts*      outputRequiredCounts)
+static nvclusterlod_Result getMeshRequirements(const MeshInput&         input,
+                                               const nvcluster_Config&  groupConfig,
+                                               const nvcluster_Config&  clusterConfig,
+                                               float                    decimationFactor,
+                                               nvclusterlod_MeshCounts& outputRequiredCounts)
 {
-  uint32_t triangleCount = input->triangleCount;
-  uint32_t minClusterSize = input->clusterConfig.minClusterSize;
-  if(input->clusterConfig.maxClusterVertices != ~0u)
+  uint32_t triangleCount  = uint32_t(input.triangleVertices.size());
+  uint32_t minClusterSize = clusterConfig.minClusterSize;
+  if(clusterConfig.maxClusterVertices != ~0u)
   {
     // Using a vertex limit reduces the minimum cluster size to 1, resulting in
     // a very large worst case of one cluster per triangle even though we rarely
@@ -964,12 +870,12 @@ nvclusterlod_Result nvclusterlodGetMeshRequirements(nvclusterlod_Context /*conte
 
   assert(triangleCount != 0);
   uint32_t lod0ClusterCount       = divCeil(triangleCount, minClusterSize) + 1;
-  uint32_t idealLevelCount        = uint32_t(ceilf(-logf(float(lod0ClusterCount)) / logf(input->decimationFactor)));
-  uint32_t idealClusterCount = lod0ClusterCount * idealLevelCount;
-  uint32_t idealClusterGroupCount = divCeil(idealClusterCount, input->groupConfig.minClusterSize);
+  uint32_t idealLevelCount        = uint32_t(ceilf(-logf(float(lod0ClusterCount)) / logf(decimationFactor)));
+  uint32_t idealClusterCount      = lod0ClusterCount * idealLevelCount;
+  uint32_t idealClusterGroupCount = divCeil(idealClusterCount, groupConfig.minClusterSize);
 
   // TODO: actually validate against overflow
-  *outputRequiredCounts = nvclusterlod_MeshCounts{
+  outputRequiredCounts = nvclusterlod_MeshCounts{
       .triangleCount = idealClusterCount * minClusterSize,
       .clusterCount  = idealClusterCount,
       .groupCount    = idealClusterGroupCount * 4,  // DANGER: group min-cluster-count is less than the max
@@ -978,35 +884,36 @@ nvclusterlod_Result nvclusterlodGetMeshRequirements(nvclusterlod_Context /*conte
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
 }
 
-
-nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nvclusterlod_MeshInput* inputPtr, nvclusterlod_MeshOutput* output)
+template <bool Parallelize>
+nvclusterlod_Result buildMesh(nvclusterlod_Context    context,
+                              const MeshInput&        input,
+                              const nvcluster_Config& groupConfig,
+                              const nvcluster_Config& clusterConfig,
+                              float                   decimationFactor,
+                              MeshOutput&             output)
 {
   Stopwatch sw(__func__);
 
-  const nvclusterlod_MeshInput& input = *inputPtr;
-
-  if(input.clusterConfig.maxClusterVertices != ~0u && input.clusterConfig.itemVertexCount != 3)
+  if(clusterConfig.maxClusterVertices != ~0u && clusterConfig.itemVertexCount != 3)
   {
     // User wants to set a vertex limit. Only triangles are supported, which
     // have 3 vertices.
     return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTER_ITEM_VERTEX_COUNT_NOT_THREE;
   }
 
-  nvclusterlod::OutputWritePositions outputCounters{};
-
   // Populate initial mesh input in a common structure. Subsequent passes
   // contain results from the previous level of detail.
   nvclusterlod::DecimatedClusterGroups decimatedClusterGroups{
-      .groupTriangleRanges = {{0, input.triangleCount}},  // The first pass uses the entire input mesh, hence we only have one large group of triangles
+      .groupTriangleRanges = {{0, uint32_t(input.triangleVertices.size())}},  // The first pass uses the entire input mesh, hence we only have one large group of triangles
       .mesh = input,
       .decimatedTriangleStorage = {},  // initial source is input.mesh so this is empty. Further passes will write the index buffer for the decimated triangles of the LODs
       .groupQuadricErrors = {0.0f},    // In the first pass no error has yet been accumulated
       .baseClusterGroupIndex = NVCLUSTERLOD_ORIGINAL_MESH_GROUP,  // The first group represents the original mesh, hence we mark it as the original group
-      .globalLockedVertices = std::vector<uint8_t>(input.vertexCount, 0),  // No vertices are locked in the original mesh
+      .globalLockedVertices = std::vector<uint8_t>(input.vertexPositions.size(), 0),  // No vertices are locked in the original mesh
   };
 
   // Initial clustering
-  DEBUG_PRINT("Initial clustering (%u triangles)\n", input.triangleCount);
+  DEBUG_PRINT("Initial clustering (%u triangles)\n", uint32_t(input.triangleVertices.size()));
 
 #if PRINT_OPS
   uint32_t lodLevel = 0;
@@ -1026,40 +933,40 @@ nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nv
     // Later iterations will take the clusters from the previous iteration as input. The function generateTriangleClusters
     // will then create a set of clusters within each of the input clusters.
     nvclusterlod::TriangleClusters triangleClusters{};
-    nvclusterlod_Result success = generateTriangleClusters(context, decimatedClusterGroups, input.clusterConfig, triangleClusters);
-    if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    if(const nvclusterlod_Result r = generateTriangleClusters<Parallelize>(context->clusterContext, decimatedClusterGroups,
+                                                                           clusterConfig, triangleClusters);
+       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
-      return success;
+      return r;
     }
 
     // Compute the adjacency between clusters: for each cluster clusterAdjacency will contain a map of
     // its adjacent clusters along with the number of vertices shared with each of those clusters. The adjacency information is symmetric.
     // This is important as it feeds into the weights for making groups of clusters.
     nvclusterlod::ClusterAdjacency clusterAdjacency{};
-    success = computeClusterAdjacency(decimatedClusterGroups, triangleClusters, clusterAdjacency);
-    if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    if(const nvclusterlod_Result r = computeClusterAdjacency(decimatedClusterGroups, triangleClusters, clusterAdjacency);
+       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
-      return success;
+      return r;
     }
 
 
     // Make clusters of clusters, called "cluster groups" or just "groups".
-    uint32_t                    globalGroupOffset = outputCounters.groupCluster;
     nvclusterlod::ClusterGroups clusterGroups{};
-    success = groupClusters(context->clusterContext, triangleClusters, input.groupConfig, globalGroupOffset,
-                            clusterAdjacency, clusterGroups);
-    if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    if(const nvclusterlod_Result r =
+           groupClusters<Parallelize>(context->clusterContext, triangleClusters, groupConfig,
+                                      output.groupClusterRanges.allocatedCount(), clusterAdjacency, clusterGroups);
+       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
-      return success;
+      return r;
     }
 
     // Write the generated clusters and cluster groups representing the mesh at the current LOD
-    success = nvclusterlod::writeClusters(decimatedClusterGroups, clusterGroups, triangleClusters, *output, outputCounters);
-    if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    if(const nvclusterlod_Result r = nvclusterlod::writeClusters(decimatedClusterGroups, clusterGroups, triangleClusters, output);
+       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
-      return success;
+      return r;
     }
-
 
     // Exit when there is just one cluster, meaning the decimation reached the level where the entire mesh geometry fits within a single cluster
     uint32_t clusterCount = uint32_t(triangleClusters.clustering.clusterItemRanges.size());
@@ -1074,16 +981,14 @@ nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nv
 
     // Decimate within cluster groups to create the next LOD level
     DEBUG_PRINT("Decimating lod %d (%d clusters)\n", lodLevel++, clusterCount);
-
-    float maxDecimationFactor = float(clusterCount - 1) / float(clusterCount);
-    float decimationFactor    = std::min(maxDecimationFactor, input.decimationFactor);
-    success = decimateClusterGroups(decimatedClusterGroups, triangleClusters, clusterGroups, decimationFactor);
-
-    if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    float maxDecimationFactor   = float(clusterCount - 1) / float(clusterCount);
+    float levelDecimationFactor = std::min(maxDecimationFactor, decimationFactor);
+    if(const nvclusterlod_Result r = decimateClusterGroups<Parallelize>(decimatedClusterGroups, triangleClusters, clusterGroups,
+                                                                        clusterConfig.maxClusterSize, levelDecimationFactor);
+       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
-      return success;
+      return r;
     }
-
 
     // Make sure the number of triangles is always going down. This may fail for
     // high decimation factors.
@@ -1098,22 +1003,41 @@ nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nv
     // of groups will not decimate and need zeroes written instead.
     for(size_t i = 0; i < decimatedClusterGroups.groupQuadricErrors.size(); i++)
     {
-      output->groupQuadricErrors[outputCounters.groupQuadricError] = decimatedClusterGroups.groupQuadricErrors[i];
-      outputCounters.groupQuadricError++;
+      output.groupQuadricErrors.append(decimatedClusterGroups.groupQuadricErrors[i]);
     }
   }
 
   // Write zeroes for the final LOD level of groups (of which there is only
   // one), which do not decimate
   // TODO: shouldn't this be infinite error so it's always drawn?
-  output->groupQuadricErrors[outputCounters.groupQuadricError] = 0.f;
-  outputCounters.groupQuadricError++;
-
-  output->clusterCount  = outputCounters.clusterTriangleRange;
-  output->groupCount    = outputCounters.groupCluster;
-  output->lodLevelCount = outputCounters.lodLevelGroup;
-  output->triangleCount = outputCounters.clusterTriangleVertex;
-
-
+  output.groupQuadricErrors.append(0.f);
   return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+}
+
+}  // namespace nvclusterlod
+
+nvclusterlod_Result nvclusterlodGetMeshRequirements(nvclusterlod_Context /* context */,
+                                                    const nvclusterlod_MeshInput* input,
+                                                    nvclusterlod_MeshCounts*      outputRequiredCounts)
+{
+  return getMeshRequirements(nvclusterlod::MeshInput::fromCAPI(*input), input->groupConfig, input->clusterConfig,
+                             input->decimationFactor, *outputRequiredCounts);
+}
+
+// Main C API entry point, adding bounds checking
+nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nvclusterlod_MeshInput* input, nvclusterlod_MeshOutput* output)
+{
+  nvclusterlod::MeshOutput outputAllocator(*output);
+#if !defined(NVCLUSTERLOD_MULTITHREADED) || NVCLUSTERLOD_MULTITHREADED
+  auto buildMesh = context->parallelize ? nvclusterlod::buildMesh<true> : nvclusterlod::buildMesh<false>;
+#else
+  auto buildMesh = nvclusterlod::buildMesh<false>;
+#endif
+  if(const nvclusterlod_Result r = buildMesh(context, nvclusterlod::MeshInput::fromCAPI(*input), input->groupConfig,
+                                             input->clusterConfig, input->decimationFactor, outputAllocator);
+     r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+  {
+    return r;
+  }
+  return outputAllocator.writeCounts(*output);
 }

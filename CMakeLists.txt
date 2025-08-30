@@ -19,6 +19,7 @@ cmake_minimum_required(VERSION 3.20)
 project(nv_cluster_lod_builder VERSION 2.0)
 
 option(NVCLUSTERLOD_MULTITHREADED "Use parallel algorithms to generate clusters." ON)
+set(NVCLUSTER_MULTITHREADED ${NVCLUSTERLOD_MULTITHREADED} CACHE BOOL "Build with multithreaded cluster generation support" FORCE)
 
 if(NOT TARGET meshoptimizer)
   add_subdirectory(meshoptimizer)
@@ -27,8 +28,23 @@ if(NOT TARGET nv_cluster_builder)
   add_subdirectory(nv_cluster_builder)
 endif()
 
-file(GLOB SOURCES src/*.h src/*.hpp src/*.c src/*.cpp)
-file(GLOB HEADERS include/nvclusterlod/*.h include/nvclusterlod/*.hpp )
+set(SOURCES
+  src/array_view.hpp
+  src/array_view.natvis
+  src/nvclusterlod_context.cpp
+  src/nvclusterlod_context.hpp
+  src/nvclusterlod_hierarchy.cpp
+  src/nvclusterlod_mesh.cpp
+  src/nvclusterlod_cpp.hpp
+)
+set(HEADERS
+  include/nvclusterlod/nvclusterlod_cache.hpp
+  include/nvclusterlod/nvclusterlod_common.h
+  include/nvclusterlod/nvclusterlod_hierarchy.h
+  include/nvclusterlod/nvclusterlod_hierarchy_storage.hpp
+  include/nvclusterlod/nvclusterlod_mesh.h
+  include/nvclusterlod/nvclusterlod_mesh_storage.hpp
+)
 
 source_group("public_include" FILES ${HEADERS})
 source_group("source" FILES ${SOURCES})
@@ -84,10 +100,7 @@ endif()
 # Headers from nv_cluster_builder are used in the API
 target_link_libraries(nv_cluster_lod_builder PUBLIC nv_cluster_builder)
 target_link_libraries(nv_cluster_lod_builder PRIVATE meshoptimizer)
-
-if(NOT NVCLUSTERLOD_MULTITHREADED)
-  target_compile_definitions(nv_cluster_lod_builder PRIVATE -DNVCLUSTERLOD_MULTITHREADED=0)
-endif()
+target_compile_definitions(nv_cluster_lod_builder PUBLIC NVCLUSTERLOD_MULTITHREADED=$<BOOL:${NVCLUSTERLOD_MULTITHREADED}>)
 
 if(NOT MSVC)
   # Optional TBB for std::execution on linux

@@ -26,4 +26,5 @@
 struct nvclusterlod_Context_t
 {
   nvcluster_Context clusterContext;
+  bool              parallelize = false;
 };

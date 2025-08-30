@@ -115,7 +115,6 @@ typedef struct nvclusterlod_MeshOutput
   uint32_t* clusterGeneratingGroups NVCLUSTERLOD_DEFAULT(nullptr);
 
   // Bounding spheres of the clusters, may be nullptr
-  // TODO: verify 'may be nullptr' - likely doesn't work anymore
   nvclusterlod_Sphere* clusterBoundingSpheres NVCLUSTERLOD_DEFAULT(nullptr);
 
   // Error metric after decimating geometry in each group. Counter-intuitively,
