@@ -77,10 +77,9 @@ inline bool isInside(const Sphere& inner, const Sphere& outer)
          && length_squared(inner.center - outer.center) <= radiusDifference * radiusDifference;
 }
 
-// Safer nvclusterlod_MeshInput wrapper with bounds checkable spans around C API
-struct MeshInput
+struct Mesh
 {
-  static MeshInput fromCAPI(const nvclusterlod_MeshInput& input)
+  static Mesh fromCAPI(const nvclusterlod_MeshInput& input)
   {
     return {.triangleVertices = {reinterpret_cast<const nvcluster::vec3u*>(input.triangleVertices), input.triangleCount},
             .vertexPositions = {reinterpret_cast<const nvcluster::vec3f*>(input.vertexPositions), input.vertexCount,
@@ -88,6 +87,18 @@ struct MeshInput
   }
   std::span<const nvcluster::vec3u> triangleVertices;
   ArrayView<const nvcluster::vec3f> vertexPositions;
+};
+
+// Safer nvclusterlod_MeshInput wrapper with bounds checkable spans around C API
+struct MeshInput
+{
+  MeshInput(const nvclusterlod_MeshInput& input)
+      : mesh(Mesh::fromCAPI(input))
+      , capi(input)
+  {
+  }
+  Mesh                          mesh;
+  const nvclusterlod_MeshInput& capi;
 };
 
 // Safer nvclusterlod_MeshOutput wrapper with bounds checkable spans around C API

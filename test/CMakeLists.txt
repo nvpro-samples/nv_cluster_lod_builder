@@ -33,6 +33,13 @@ add_executable(nv_cluster_lod_builder_tests
 )
 target_link_libraries(nv_cluster_lod_builder_tests nv_cluster_lod_builder gtest_main gmock_main)
 
+# opportunistically 
+if(TARGET meshoptimizer)
+  target_link_libraries(nv_cluster_lod_builder_tests meshoptimizer)
+  target_compile_definitions(nv_cluster_lod_builder_tests PRIVATE TESTS_HAVE_MESHOPTIMIZER=1)
+else()
+  target_compile_definitions(nv_cluster_lod_builder_tests PRIVATE TESTS_HAVE_MESHOPTIMIZER=0)
+endif()
 
 if(MSVC)
     target_compile_options(nv_cluster_lod_builder_tests PRIVATE

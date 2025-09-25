@@ -117,6 +117,7 @@ static inline nvclusterlod_Result makeBoundingSphere(std::span<const nvclusterlo
   sphere.radius                = nvcluster::length(f.center - sphere.center) + f.radius;
   sphere.radius                = std::nextafter(sphere.radius, std::numeric_limits<float>::max());
   sphere.radius = std::nextafter(sphere.radius, std::numeric_limits<float>::max());  // fixes a test failure. or * 1.0001?
+  sphere.radius = std::nextafter(sphere.radius, std::numeric_limits<float>::max());
   if(std::isnan(sphere.center[0]) || std::isnan(sphere.center[1]) || std::isnan(sphere.center[2]) || std::isnan(sphere.radius))
   {
     return nvclusterlod_Result::NVCLUSTERLOD_ERROR_PRODUCED_NAN_BOUNDING_SPHERES;

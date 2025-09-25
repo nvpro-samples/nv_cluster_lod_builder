@@ -1,5 +1,11 @@
 # Changelog
 
+## [4]
+
+### Added
+
+- Optional decimation callback
+
 ## [3]
 
 ### Added

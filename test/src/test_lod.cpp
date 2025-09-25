@@ -34,6 +34,10 @@
 #include <span>
 #include <unordered_map>
 
+#if TESTS_HAVE_MESHOPTIMIZER
+#include <meshoptimizer.h>
+#endif
+
 using nvcluster::vec3f;
 using nvcluster::vec3u;
 using nvcluster::vec4f;
@@ -203,6 +207,116 @@ GeometryMesh makeIcosphere(int subdivision)
   return GeometryMesh{triangles, positions};
 }
 
+// Collapses edges until the output triangle count is met. Prioritizes
+// collapsing edges with at least one non-locked vertex. Returns the number of
+// triangles written to collapsedTriangles.
+uint32_t collapseUnlockedEdges(std::span<const vec3u>   triangles,
+                               std::span<const uint8_t> lockedVertices,
+                               std::span<vec3u>         collapsedTriangles,
+                               uint32_t                 targetTriangleCount)
+{
+  assert(!collapsedTriangles.empty());
+
+  // Duplicate the input triangles as we need to modify them
+  std::ranges::copy(triangles, collapsedTriangles.begin());
+
+  // Track the active set of triangles that have not been made degenerate as
+  // part of an edge collapse. This allows indices into collapsedTriangles to
+  // remain valid.
+  std::set<uint32_t> remainingTriangles;
+  for(uint32_t i = 0; i < uint32_t(triangles.size()); i++)
+  {
+    remainingTriangles.insert(i);
+  }
+
+  // Maintain a list of triangles per vertex for quick lookup
+  std::unordered_map<uint32_t, std::vector<uint32_t>> vertexTriangles;
+  for(uint32_t i = 0; i < triangles.size(); i++)
+  {
+    for(uint32_t j = 0; j < 3; j++)
+    {
+      vertexTriangles[triangles[i][j]].push_back(i);
+    }
+  }
+
+  // Collapse edges until the output triangle count is met
+  std::mt19937 g(0);
+  while(remainingTriangles.size() > targetTriangleCount)
+  {
+    // Find the first non-locked edge, {maybe-locked vertex, not-locked vertex}
+    std::optional<std::pair<uint32_t, uint32_t>> edge;
+    std::vector<uint32_t> shuffledRemainingTriangles(remainingTriangles.begin(), remainingTriangles.end());  // wasteful but quick
+    std::shuffle(shuffledRemainingTriangles.begin(), shuffledRemainingTriangles.end(), g);
+    for(const uint32_t triangleIndex : shuffledRemainingTriangles)
+    {
+      const vec3u& triangle = collapsedTriangles[triangleIndex];
+      for(uint32_t i = 0; i < 3 && !edge; i++)
+      {
+        if(lockedVertices[triangle[i]] == 0 && lockedVertices[triangle[(i + 2) % 3]] == 0)
+          edge = std::make_pair(triangle[(i + 1) % 3], triangle[i]);
+        else if(lockedVertices[triangle[(i + 1) % 3]] == 0 && lockedVertices[triangle[(i + 2) % 3]] == 0)
+          edge = std::make_pair(triangle[i], triangle[(i + 1) % 3]);
+      }
+      if(edge)
+      {
+        break;
+      }
+    }
+
+    // If no non-locked edge was found, start collapsing arbitrary edges
+    if(!edge)
+      edge = std::make_pair(collapsedTriangles[shuffledRemainingTriangles.front()][0],
+                            collapsedTriangles[shuffledRemainingTriangles.front()][1]);
+
+    // Collapse the edge (second vertex becomes the first vertex)
+    assert(vertexTriangles.find(edge->second) != vertexTriangles.end());
+    assert(edge->second != edge->first);  // doesn't handle degenerates in input
+    for(uint32_t triangleIndex : vertexTriangles[edge->second])
+    {
+      assert(triangleIndex < uint32_t(collapsedTriangles.size()));
+      vec3u& triangle = collapsedTriangles[triangleIndex];
+      for(uint32_t i = 0; i < 3; i++)
+      {
+        if(triangle[i] == edge->second)
+        {
+          if(triangle[(i + 1) % 3] == edge->first || triangle[(i + 2) % 3] == edge->first)
+          {
+            // Remove triangles that include the edge as they become degenerate
+            remainingTriangles.erase(triangleIndex);
+            break;
+          }
+          triangle[i] = edge->first;
+          vertexTriangles[edge->first].push_back(triangleIndex);
+        }
+      }
+    }
+  }
+
+  // Compact the sparse result. This requires remainingTriangles to be in
+  // ascending order.
+  static_assert(std::same_as<decltype(remainingTriangles), std::set<uint32_t>>);
+  uint32_t collapsedTriangleCount = 0;
+  for(uint32_t triangleIndex : remainingTriangles)
+  {
+    collapsedTriangles[collapsedTriangleCount++] = collapsedTriangles[triangleIndex];
+  }
+  return collapsedTriangleCount;
+}
+
+nvcluster_Bool decimateTrianglesFallback(void* /* userData */,
+                                         const nvclusterlod_DecimateTrianglesCallbackParams* params,
+                                         nvclusterlod_DecimateTrianglesCallbackResult*       result)
+{
+  uint32_t collapsedTriangleCount =
+      collapseUnlockedEdges(std::span{reinterpret_cast<const vec3u*>(params->triangleVertices), params->triangleCount},
+                            std::span{params->vertexLockFlags, params->vertexCount},
+                            std::span{reinterpret_cast<vec3u*>(params->decimatedTriangleVertices), params->triangleCount},
+                            params->targetTriangleCount);
+  *result = nvclusterlod_DecimateTrianglesCallbackResult{
+      .decimatedTriangleCount = collapsedTriangleCount, .additionalVertexCount = 0u, .quadricError = 1.0f};
+  return NVCLUSTER_TRUE;
+}
+
 // Computes the conservative maximum arcsine of any geometric error relative to
 // the camera, where 'transform' defines a transformation to eye-space.
 float conservativeErrorOverDistance(const mat4& transform, const nvclusterlod_Sphere& boundingSphereC, float objectSpaceQuadricError)
@@ -268,12 +382,14 @@ void verifyNodeRecursive(const nvclusterlod::LocalizedLodMesh& m, const nvcluste
       const nvclusterlod_Sphere& clusterOriginalSphere = m.lodMesh.clusterBoundingSpheres[clusterRange.offset + i];
       const nvclusterlod_Sphere& clusterGroupSphere    = h.groupCumulativeBoundingSpheres[node.clusterGroup.group];
 
-      // Generally, the original cluster bounding sphere should be inside the
+      // Logically, the decimated group's bounding sphere should be inside the
       // cumulative cluster bounding spheres. However, it is not included in the
-      // cumulative sphere computation. If it is slightly oversized, it can poke
-      // outside of the bounding sphere of the generating groups.
+      // cumulative sphere computation (see buildHierarchy()) and is not
+      // guaranteed to be tight. If a decimated group's bounding sphere is
+      // slightly oversized, it can poke outside of the bounding sphere of the
+      // generating groups.
       auto biggerNodeSphere = node.boundingSphere;
-      biggerNodeSphere.radius *= 1.1f;
+      biggerNodeSphere.radius *= TESTS_HAVE_MESHOPTIMIZER ? 1.2f : 1.5f;
       EXPECT_TRUE(isInside(clusterOriginalSphere, biggerNodeSphere));
 #if 0  // For debugging
       printf("A = Sphere((%f, %f, %f), %f)\n", node.boundingSphere.center.x, node.boundingSphere.center.y,
@@ -439,7 +555,8 @@ TEST(Hierarchy, BoundsAndOverlaps)
               .costOverlap       = 0.0f,
               .preSplitThreshold = 0,
           },
-      .decimationFactor = 0.5f,
+      .decimationFactor          = 0.5f,
+      .decimateTrianglesCallback = TESTS_HAVE_MESHOPTIMIZER ? nullptr : decimateTrianglesFallback,
   };
 
   nvclusterlod::LocalizedLodMesh mesh;
@@ -551,7 +668,8 @@ TEST(Mesh, VertexLimit)
               .costOverlap       = 0.0f,
               .preSplitThreshold = 0,
           },
-      .decimationFactor = 0.5f,
+      .decimationFactor          = 0.5f,
+      .decimateTrianglesCallback = TESTS_HAVE_MESHOPTIMIZER ? nullptr : decimateTrianglesFallback,
   };
 
   nvclusterlod::LocalizedLodMesh mesh;
@@ -601,7 +719,8 @@ TEST(Mesh, ClusterBoundingSpheresOptional)
               .costOverlap       = 0.0f,
               .preSplitThreshold = 0,
           },
-      .decimationFactor = 0.5f,
+      .decimationFactor          = 0.5f,
+      .decimateTrianglesCallback = TESTS_HAVE_MESHOPTIMIZER ? nullptr : decimateTrianglesFallback,
   };
 
   nvclusterlod_MeshCounts counts{};
@@ -655,6 +774,197 @@ TEST(Hierarchy, AngularError)
       EXPECT_NEAR(nvclusterlodPixelError(qeod, fov, 2048.0f), errorSize, 1e-4f);
     }
   }
+}
+
+TEST(Mesh, DecimateTrianglesCallback)
+{
+  ScopedContext    context;
+  ScopedLodContext lodContext(context);
+  GeometryMesh     icosphere{makeIcosphere(2)};
+
+  // Provide a decimation callback that uses meshopt_simplifySloppy
+  std::atomic<bool> invoked             = false;  // the callback must be thread safe
+  auto              decimateWithCapture = [&invoked](const nvclusterlod_DecimateTrianglesCallbackParams* params,
+                                        nvclusterlod_DecimateTrianglesCallbackResult*       result) -> nvcluster_Bool {
+    float quadricError = 0.0f;
+#if TESTS_HAVE_MESHOPTIMIZER
+    size_t simplifiedTriangleCount =
+        meshopt_simplifySloppy(reinterpret_cast<unsigned int*>(params->decimatedTriangleVertices),
+                               reinterpret_cast<const unsigned int*>(params->triangleVertices),
+                               params->triangleCount * 3, reinterpret_cast<const float*>(params->vertexPositions),
+                               size_t(params->vertexCount), size_t(params->vertexStride),
+                               size_t(params->targetTriangleCount) * 3, std::numeric_limits<float>::max(), &quadricError)
+        / 3;
+#else
+    // fallback to just dropping triangles
+    size_t simplifiedTriangleCount = params->targetTriangleCount;
+    std::copy_n(params->triangleVertices, params->targetTriangleCount, params->decimatedTriangleVertices);
+#endif
+    invoked = true;
+    *result = nvclusterlod_DecimateTrianglesCallbackResult{.decimatedTriangleCount = static_cast<uint32_t>(simplifiedTriangleCount),
+                                                           .additionalVertexCount = 0,
+                                                           .quadricError          = quadricError};
+    return NVCLUSTER_TRUE;
+  };
+
+  // The above lambda includes a capture, so it can't be passed through the C
+  // API directly. This wrapper demonstrates passing it as the user data
+  // instead. The '+' operator forces the wrapper to be a regular function
+  // pointer, but is not strictly needed.
+  using DecimateFn = decltype(decimateWithCapture);
+  auto callback    = +[](void* userData, const nvclusterlod_DecimateTrianglesCallbackParams* params,
+                      nvclusterlod_DecimateTrianglesCallbackResult* result) -> nvcluster_Bool {
+    auto* fn = reinterpret_cast<DecimateFn*>(userData);
+    return (*fn)(params, result);
+  };
+
+  nvclusterlod_MeshInput meshInput{
+      .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
+      .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
+      .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
+      .vertexCount      = static_cast<uint32_t>(icosphere.positions.size()),
+      .vertexStride     = sizeof(vec3f),
+      .clusterConfig =
+          {
+              .minClusterSize    = 16,
+              .maxClusterSize    = 32,
+              .costUnderfill     = 0.9f,
+              .costOverlap       = 0.5f,
+              .preSplitThreshold = 1u << 17,
+          },
+      .groupConfig =
+          {
+              .minClusterSize    = 8,
+              .maxClusterSize    = 16,
+              .costUnderfill     = 0.5f,
+              .costOverlap       = 0.0f,
+              .preSplitThreshold = 0,
+          },
+      .decimationFactor          = 0.5f,
+      .userData                  = &decimateWithCapture,
+      .decimateTrianglesCallback = callback,
+  };
+
+  nvclusterlod::LocalizedLodMesh mesh;
+  nvclusterlod_Result            result = nvclusterlod::generateLocalizedLodMesh(lodContext.context, meshInput, mesh);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+  EXPECT_TRUE(invoked);
+}
+
+TEST(Mesh, DecimateTrianglesCallbackWithAdditionalVertices)
+{
+  ScopedContext    context;
+  ScopedLodContext lodContext(context);
+  GeometryMesh     icosphere{makeIcosphere(2)};
+
+  // Pre-allocate enough space for all additional vertices
+  std::atomic<uint32_t> vertexCount         = uint32_t(icosphere.positions.size());
+  uint32_t              originalVertexCount = vertexCount;
+  icosphere.positions.resize(vertexCount * 3);
+
+  // Provide a decimation callback that uses meshopt_simplifySloppy
+  auto decimateWithCapture = [&icosphere, &vertexCount](const nvclusterlod_DecimateTrianglesCallbackParams* params,
+                                                        nvclusterlod_DecimateTrianglesCallbackResult* result) -> nvcluster_Bool {
+    float quadricError = 0.0f;
+#if TESTS_HAVE_MESHOPTIMIZER
+    size_t simplifiedTriangleCount =
+        meshopt_simplifySloppy(reinterpret_cast<unsigned int*>(params->decimatedTriangleVertices),
+                               reinterpret_cast<const unsigned int*>(params->triangleVertices),
+                               params->triangleCount * 3, reinterpret_cast<const float*>(params->vertexPositions),
+                               size_t(params->vertexCount), size_t(params->vertexStride),
+                               size_t(params->targetTriangleCount) * 3, std::numeric_limits<float>::max(), &quadricError)
+        / 3;
+#else
+    // fallback to just dropping triangles
+    size_t simplifiedTriangleCount = params->targetTriangleCount;
+    std::copy_n(params->triangleVertices, params->targetTriangleCount, params->decimatedTriangleVertices);
+#endif
+
+    // To exercise the API with adding new vertices during decimation, duplicate the inerior vertices (non-locked)
+    auto triangles = std::span(reinterpret_cast<vec3u*>(params->decimatedTriangleVertices), simplifiedTriangleCount);
+    std::map<uint32_t, uint32_t> interiorVertexDiplicates;
+    for(const vec3u& triangle : triangles)
+    {
+      for(uint32_t vertexIndex : triangle)
+      {
+        if(!params->vertexLockFlags[vertexIndex])
+        {
+          interiorVertexDiplicates.try_emplace(vertexIndex, uint32_t(interiorVertexDiplicates.size()));
+        }
+      }
+    }
+    uint32_t additionalVertexCount  = uint32_t(interiorVertexDiplicates.size());
+    uint32_t additionalVertexOffset = vertexCount.fetch_add(additionalVertexCount);
+    if(additionalVertexOffset + additionalVertexCount > icosphere.positions.size())
+    {
+      // likely calls std::terminate()
+      throw std::runtime_error("Not enough space for additional vertices");
+    }
+    for(auto [vertexIndex, duplicateIndex] : interiorVertexDiplicates)
+    {
+      icosphere.positions[additionalVertexOffset + duplicateIndex] = icosphere.positions[vertexIndex];
+    }
+    for(vec3u& triangle : triangles)
+    {
+      for(uint32_t& vertexIndex : triangle)
+      {
+        if(!params->vertexLockFlags[vertexIndex])
+        {
+          vertexIndex = additionalVertexOffset + interiorVertexDiplicates[vertexIndex];
+        }
+      }
+    }
+    *result = nvclusterlod_DecimateTrianglesCallbackResult{.decimatedTriangleCount = static_cast<uint32_t>(simplifiedTriangleCount),
+                                                           .additionalVertexCount = additionalVertexCount,
+                                                           .quadricError          = quadricError};
+    return NVCLUSTER_TRUE;
+  };
+
+  // The above lambda includes a capture, so it can't be passed through the C
+  // API directly. This wrapper demonstrates passing it as the user data
+  // instead. The '+' operator forces the wrapper to be a regular function
+  // pointer, but is not strictly needed.
+  using DecimateFn = decltype(decimateWithCapture);
+  auto callback    = +[](void* userData, const nvclusterlod_DecimateTrianglesCallbackParams* params,
+                      nvclusterlod_DecimateTrianglesCallbackResult* result) -> nvcluster_Bool {
+    auto* fn = reinterpret_cast<DecimateFn*>(userData);
+    return (*fn)(params, result);
+  };
+
+  nvclusterlod_MeshInput meshInput{
+      .triangleVertices = reinterpret_cast<const nvclusterlod_Vec3u*>(icosphere.triangles.data()),
+      .triangleCount    = static_cast<uint32_t>(icosphere.triangles.size()),
+      .vertexPositions  = reinterpret_cast<const nvcluster_Vec3f*>(icosphere.positions.data()),
+      .vertexCount      = vertexCount,
+      .vertexStride     = sizeof(vec3f),
+      .clusterConfig =
+          {
+              .minClusterSize    = 16,
+              .maxClusterSize    = 32,
+              .costUnderfill     = 0.9f,
+              .costOverlap       = 0.5f,
+              .preSplitThreshold = 1u << 17,
+          },
+      .groupConfig =
+          {
+              .minClusterSize    = 8,
+              .maxClusterSize    = 16,
+              .costUnderfill     = 0.5f,
+              .costOverlap       = 0.0f,
+              .preSplitThreshold = 0,
+          },
+      .decimationFactor          = 0.5f,
+      .userData                  = &decimateWithCapture,
+      .decimateTrianglesCallback = callback,
+  };
+
+  nvclusterlod::LocalizedLodMesh mesh;
+  nvclusterlod_Result            result = nvclusterlod::generateLocalizedLodMesh(lodContext.context, meshInput, mesh);
+  ASSERT_EQ(result, nvclusterlod_Result::NVCLUSTERLOD_SUCCESS);
+  EXPECT_GT(vertexCount, originalVertexCount) << "No new vertices were added";
+  EXPECT_TRUE(std::ranges::any_of(mesh.vertexGlobalIndices, [originalVertexCount](uint32_t vertexIndex) {
+    return vertexIndex >= originalVertexCount;
+  })) << "No new vertices were referenced";
 }
 
 extern "C" int runCTest(void);

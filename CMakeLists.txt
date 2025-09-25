@@ -21,8 +21,16 @@ project(nv_cluster_lod_builder VERSION 2.0)
 option(NVCLUSTERLOD_MULTITHREADED "Use parallel algorithms to generate clusters." ON)
 set(NVCLUSTER_MULTITHREADED ${NVCLUSTERLOD_MULTITHREADED} CACHE BOOL "Build with multithreaded cluster generation support" FORCE)
 
-if(NOT TARGET meshoptimizer)
-  add_subdirectory(meshoptimizer)
+option(NVCLUSTERLOD_FETCH_MESHOPTIMIZER "Fetch meshoptimizer if not found" ON)
+if(NOT TARGET meshoptimizer AND NVCLUSTERLOD_FETCH_MESHOPTIMIZER)
+  include(FetchContent)
+  FetchContent_Declare(
+    meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG v0.25
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(meshoptimizer)
 endif()
 if(NOT TARGET nv_cluster_builder)
   add_subdirectory(nv_cluster_builder)
@@ -99,7 +107,12 @@ endif()
 
 # Headers from nv_cluster_builder are used in the API
 target_link_libraries(nv_cluster_lod_builder PUBLIC nv_cluster_builder)
-target_link_libraries(nv_cluster_lod_builder PRIVATE meshoptimizer)
+if(TARGET meshoptimizer)
+  target_link_libraries(nv_cluster_lod_builder PRIVATE meshoptimizer)
+  target_compile_definitions(nv_cluster_lod_builder PRIVATE NVCLUSTERLOD_HAS_MESHOPTIMIER=1)
+else()
+  target_compile_definitions(nv_cluster_lod_builder PRIVATE NVCLUSTERLOD_HAS_MESHOPTIMIER=0)
+endif()
 target_compile_definitions(nv_cluster_lod_builder PUBLIC NVCLUSTERLOD_MULTITHREADED=$<BOOL:${NVCLUSTERLOD_MULTITHREADED}>)
 
 if(NOT MSVC)

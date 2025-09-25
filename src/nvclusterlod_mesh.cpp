@@ -21,7 +21,6 @@
 #include <array_view.hpp>
 #include <cstdint>
 #include <execution>
-#include <meshoptimizer.h>
 #include <nvcluster/nvcluster.h>
 #include <nvcluster/nvcluster_storage.hpp>
 #include <nvcluster/util/parallel.hpp>
@@ -35,6 +34,10 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+
+#if NVCLUSTERLOD_HAS_MESHOPTIMIER
+#include <meshoptimizer.h>
+#endif
 
 static constexpr uint32_t NVLOD_MINIMAL_ADJACENCY_SIZE          = 5;
 static constexpr uint32_t NVLOD_LOCKED_VERTEX_WEIGHT_MULTIPLIER = 10;
@@ -98,6 +101,28 @@ namespace nvclusterlod {
 using nvcluster::vec3f;
 using nvcluster::vec3u;
 
+// Value+error pair, like std::expected (C++23)
+// Avoids mistakes with out-parameter lifetimes and memory aliasing
+template <typename T>
+struct Expected
+{
+  std::optional<T>    value;
+  nvclusterlod_Result error = nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  Expected(T&& val)
+      : value(std::move(val))
+  {
+  }
+  Expected(nvclusterlod_Result err)
+      : error(err)
+  {
+  }
+  bool     has_value() const { return value.has_value(); }
+  T*       operator->() { return &*value; }
+  const T* operator->() const { return &*value; }
+  T&       operator*() { return *value; }
+  const T& operator*() const { return *value; }
+};
+
 // Clustered triangles for all groups, hence SegmentedClustering. Each segment
 // is a group from the previous LOD iteration. Within each segment triangles are
 // re-clustered.
@@ -146,7 +171,7 @@ struct DecimatedClusterGroups
 
   // Triangle indices and vertices. Triangles are grouped by
   // groupTriangleRanges. Vertices always point to the input mesh vertices.
-  MeshInput mesh;
+  Mesh mesh;
 
   // Storage for decimated triangles from the previous pass. Note that triangles
   // are written to the output in clusters, which are formed from these at the
@@ -167,7 +192,7 @@ struct DecimatedClusterGroups
 };
 
 // Find the vertex in the mesh that is the farthest from the start point.
-inline std::optional<nvcluster::vec3f> farthestPoint(const MeshInput& mesh, const nvcluster::vec3f& target)
+inline std::optional<nvcluster::vec3f> farthestPoint(const Mesh& mesh, const nvcluster::vec3f& target)
 {
   const nvcluster::vec3f* result      = nullptr;
   float                   maxLengthSq = -1.0f;
@@ -194,7 +219,7 @@ inline std::optional<nvcluster::vec3f> farthestPoint(const MeshInput& mesh, cons
 
 // Ritter's bounding sphere algorithm
 // https://en.wikipedia.org/wiki/Bounding_sphere
-inline nvclusterlod_Result makeBoundingSphere(const MeshInput& mesh, nvclusterlod::Sphere& sphere)
+inline nvclusterlod_Result makeBoundingSphere(const Mesh& mesh, nvclusterlod::Sphere& sphere)
 {
   if(mesh.triangleVertices.empty())
   {
@@ -224,12 +249,13 @@ inline nvclusterlod_Result makeBoundingSphere(const MeshInput& mesh, nvclusterlo
 // From a triangle mesh and a partition of its triangles into a number of triangle ranges (DecimatedClusterGroups::groupTriangleRanges), generate a number of clusters within each range
 // according to the requested clusterConfig.
 template <bool Parallelize>
-static nvclusterlod_Result generateTriangleClusters(nvcluster_Context             context,
-                                                    const DecimatedClusterGroups& decimatedClusterGroups,
-                                                    const nvcluster_Config&       clusterConfig,
-                                                    TriangleClusters&             output)
+static Expected<TriangleClusters> generateTriangleClusters(nvcluster_Context             context,
+                                                           const DecimatedClusterGroups& decimatedClusterGroups,
+                                                           const nvcluster_Config&       clusterConfig)
 {
   Stopwatch sw(__func__);
+
+  TriangleClusters output;
 
   // Compute the bounding boxes and centroids for each triangle
   size_t                       triangleCount = decimatedClusterGroups.mesh.triangleVertices.size();
@@ -270,7 +296,7 @@ static nvclusterlod_Result generateTriangleClusters(nvcluster_Context           
       output.clustering);
   if(clusteringResult != nvcluster_Result::NVCLUSTER_SUCCESS)
   {
-    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_TRIANGLES_FAILED;
+    return {nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_TRIANGLES_FAILED};
   }
 
   // For each generated cluster, compute its bounding box so the boxes can be used as input for potential further clustering
@@ -293,7 +319,7 @@ static nvclusterlod_Result generateTriangleClusters(nvcluster_Context           
   // LOD level.
   output.generatingGroupOffset = decimatedClusterGroups.baseClusterGroupIndex;
 
-  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  return Expected<TriangleClusters>(std::move(output));
 }
 
 // Make clusters of clusters, referred to as "groups", using the cluster adjacency to optimize clustering by keeping
@@ -301,12 +327,11 @@ static nvclusterlod_Result generateTriangleClusters(nvcluster_Context           
 // important for quality of the recursive decimation.
 // This function also sanitizes the cluster adjacency by removing connections involving less than NVLOD_MINIMAL_ADJACENCY_SIZE vertices.
 template <bool Parallelize>
-static nvclusterlod_Result groupClusters(nvcluster_Context       context,
-                                         const TriangleClusters& triangleClusters,
-                                         const nvcluster_Config& clusterGroupConfig,
-                                         uint32_t                globalGroupOffset,
-                                         ClusterAdjacency&       clusterAdjacency,
-                                         ClusterGroups&          result)
+static Expected<ClusterGroups> groupClusters(nvcluster_Context       context,
+                                             const TriangleClusters& triangleClusters,
+                                             const nvcluster_Config& clusterGroupConfig,
+                                             uint32_t                globalGroupOffset,
+                                             ClusterAdjacency&       clusterAdjacency)
 {
   Stopwatch sw(__func__);
   using AdjacentCounts = std::unordered_map<uint32_t, AdjacencyVertexCount>;
@@ -399,7 +424,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
       .connectionCount       = uint32_t(adjacencyItems.size()),
   };
 
-  result                   = {};
+  ClusterGroups result     = {};
   result.globalGroupOffset = globalGroupOffset;
 
   nvcluster_Result clusterResult;
@@ -410,7 +435,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
   }
   if(clusterResult != nvcluster_Result::NVCLUSTER_SUCCESS)
   {
-    return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_TRIANGLES_FAILED;
+    return {nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTERING_TRIANGLES_FAILED};
   }
 
   // Compute the total triangle count for each group of clusters of triangles
@@ -429,7 +454,7 @@ static nvclusterlod_Result groupClusters(nvcluster_Context       context,
       }
     }
   }
-  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  return Expected<ClusterGroups>(std::move(result));
 }
 
 static nvclusterlod_Result writeClusters(const DecimatedClusterGroups& decimatedClusterGroups,
@@ -485,7 +510,6 @@ static nvclusterlod_Result writeClusters(const DecimatedClusterGroups& decimated
     // efficient.
     std::ranges::sort(clusterGroup, [&gg = clusterGeneratingGroups](uint32_t a, uint32_t b) { return gg[a] < gg[b]; });
 
-
 #if 0
       // Print the generating group membership counts
       std::unordered_map<uint32_t, uint32_t> generatingGroupCounts;
@@ -525,7 +549,7 @@ static nvclusterlod_Result writeClusters(const DecimatedClusterGroups& decimated
       if(meshOutput.clusterBoundingSpheres.capacity())
       {
         // Compute bounding spheres for just the triangles in the current cluster
-        MeshInput mesh{meshOutput.triangleVertices.allocated().subspan(trianglesBeginIndex), decimatedClusterGroups.mesh.vertexPositions};
+        Mesh mesh{meshOutput.triangleVertices.allocated().subspan(trianglesBeginIndex), decimatedClusterGroups.mesh.vertexPositions};
         nvclusterlod_Result result = makeBoundingSphere(mesh, meshOutput.clusterBoundingSpheres.allocate());
         if(result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
         {
@@ -548,11 +572,11 @@ struct VertexAdjacency : std::array<uint32_t, 8>
 // Returns shared vertex counts between pairs of clusters. The use of the fixed
 // sized VertexAdjacency limits cluster vertex valence (not triangle vertex
 // valence), but this should be rare for well formed meshes.
-static nvclusterlod_Result computeClusterAdjacency(const DecimatedClusterGroups& decimatedClusterGroups,
-                                                   const TriangleClusters&       triangleClusters,
-                                                   ClusterAdjacency&             result)
+static ClusterAdjacency computeClusterAdjacency(const DecimatedClusterGroups& decimatedClusterGroups, const TriangleClusters& triangleClusters)
 {
   Stopwatch sw(__func__);
+
+  ClusterAdjacency result;
 
   // Allocate the cluster connectivity: each cluster will have a map containing the indices of the clusters adjacent to it
   result.resize(triangleClusters.clustering.clusterItemRanges.size());
@@ -633,20 +657,18 @@ static nvclusterlod_Result computeClusterAdjacency(const DecimatedClusterGroups&
       }
     }
   }
-  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  return result;
 }
 
 // Returns a vector of per-vertex boolean uint8_t values indicating which
 // vertices are shared between clusters. Must be uint8_t because that's what
 // meshoptimizer takes.
-static std::vector<uint8_t> computeLockedVertices(const MeshInput&        inputMesh,
-                                                  const TriangleClusters& triangleClusters,
-                                                  const ClusterGroups&    clusterGrouping)
+static std::vector<uint8_t> computeLockedVertices(const Mesh& inputMesh, const TriangleClusters& triangleClusters, const ClusterGroups& clusterGrouping)
 {
   Stopwatch                sw(__func__);
   constexpr const uint32_t VERTEX_NOT_SEEN = 0xffffffff;
   constexpr const uint32_t VERTEX_ADDED    = 0xfffffffe;
-  std::vector<uint8_t>     lockedVertices(inputMesh.vertexPositions.size(), 0);
+  std::vector<uint8_t>     vertexLockFlags(inputMesh.vertexPositions.size(), 0);
   std::vector<uint32_t>    vertexClusterGroups(inputMesh.vertexPositions.size(), VERTEX_NOT_SEEN);
   for(uint32_t clusterGroupIndex = 0; clusterGroupIndex < uint32_t(clusterGrouping.groups.clusterItemRanges.size()); ++clusterGroupIndex)
   {
@@ -677,48 +699,114 @@ static std::vector<uint8_t> computeLockedVertices(const MeshInput&        inputM
             // Vertex has been seen before and in another cluster group, so it
             // must be shared. VertexAdded is not necessary, but indicates how a
             // unique list of locked vertices might be populated.
-            lockedVertices[vertexIndex] = 1;
+            vertexLockFlags[vertexIndex] = 1;
             vertexClusterGroup          = VERTEX_ADDED;
           }
         }
       }
     }
   }
-  return lockedVertices;
+  return vertexLockFlags;
 }
+
+#if NVCLUSTERLOD_HAS_MESHOPTIMIER
+uint32_t decimateTrianglesDefault(const Mesh&              inputMesh,
+                                  std::span<const uint8_t> vertexLockFlags,
+                                  uint32_t                 targetTriangleCount,
+                                  std::span<vec3u>         decimatedTriangleVertices,
+                                  float&                   quadricError)
+{
+  constexpr float targetError = std::numeric_limits<float>::max();
+  unsigned int options = meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute;  // no meshopt_SimplifyLockBorder as we only care about vertices shared between cluster groups
+  size_t simplifiedTriangleCount =
+      meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
+                                     reinterpret_cast<const unsigned int*>(inputMesh.triangleVertices.data()),
+                                     inputMesh.triangleVertices.size() * 3,
+                                     reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                     inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(), nullptr, 0, nullptr,
+                                     0, vertexLockFlags.data(), targetTriangleCount * 3, targetError, options, &quadricError)
+      / 3;
+
+  if(targetTriangleCount < simplifiedTriangleCount)
+  {
+    DEBUG_PRINT("Warning: decimation failed (%zu < %zu). Retrying, ignoring topology\n", targetTriangleCount, simplifiedTriangleCount);
+    std::vector<vec3u> positionUniqueTriangleVertices(inputMesh.triangleVertices.size());
+    meshopt_generateShadowIndexBuffer(reinterpret_cast<unsigned int*>(positionUniqueTriangleVertices.data()),
+                                      reinterpret_cast<const unsigned int*>(inputMesh.triangleVertices.data()),
+                                      inputMesh.triangleVertices.size() * 3,
+                                      reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                      inputMesh.vertexPositions.size(), sizeof(vec3f), inputMesh.vertexPositions.stride());
+    simplifiedTriangleCount =
+        meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
+                                       reinterpret_cast<const unsigned int*>(positionUniqueTriangleVertices.data()),
+                                       positionUniqueTriangleVertices.size() * 3,
+                                       reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                       inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(), nullptr, 0, nullptr,
+                                       0, vertexLockFlags.data(), targetTriangleCount * 3, targetError, options, &quadricError)
+        / 3;
+    if(targetTriangleCount < simplifiedTriangleCount)
+    {
+      DEBUG_PRINT("Warning: decimation failed (%zu < %zu). Retrying, ignoring locked\n", targetTriangleCount, simplifiedTriangleCount);
+      simplifiedTriangleCount =
+          meshopt_simplifySloppy(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
+                                 reinterpret_cast<const unsigned int*>(positionUniqueTriangleVertices.data()),
+                                 positionUniqueTriangleVertices.size() * 3,
+                                 reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
+                                 inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(),
+                                 targetTriangleCount * 3, targetError, &quadricError)
+          / 3;
+    }
+  }
+
+  // Handle a case when meshopt_simplifySloppy() sometimes returns no
+  // triangles for very sparse geometry.
+  if(simplifiedTriangleCount == 0)
+  {
+    DEBUG_PRINT("Warning: decimation produced no triangles. Adding the first back\n");
+    simplifiedTriangleCount++;
+    decimatedTriangleVertices[0] = inputMesh.triangleVertices[0];
+  }
+  return uint32_t(simplifiedTriangleCount);
+}
+#endif  // NVCLUSTERLOD_HAS_MESHOPTIMIER
 
 // Returns groups of triangle after decimating groups of clusters. These
 // triangles will be regrouped into new clusters within their current group.
 template <bool Parallelize>
-static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current,
-                                                 const TriangleClusters& triangleClusters,
-                                                 const ClusterGroups&    clusterGrouping,
-                                                 uint32_t                maxTrianglesPerCluster,
-                                                 float                   lodLevelDecimationFactor)
+static Expected<DecimatedClusterGroups> decimateClusterGroups(const Mesh              inputMesh,
+                                                              const TriangleClusters& triangleClusters,
+                                                              const ClusterGroups&    clusterGrouping,
+                                                              uint32_t                maxTrianglesPerCluster,
+                                                              float                   lodLevelDecimationFactor,
+                                                              nvclusterlod_DecimateTrianglesCallback decimateTrianglesCallback,
+                                                              void* userData)
 {
-  Stopwatch              sw(__func__);
-  const MeshInput&       inputMesh = current.mesh;
-  DecimatedClusterGroups result;
-  // Compute vertices shared between cluster groups. These will be locked during
-  // decimation.
-  result.globalLockedVertices = computeLockedVertices(inputMesh, triangleClusters, clusterGrouping);
-  result.decimatedTriangleStorage.resize(clusterGrouping.totalTriangleCount);  // space for worst case
-  result.groupTriangleRanges.resize(clusterGrouping.groups.clusterItemRanges.size());
-  result.groupQuadricErrors.resize(clusterGrouping.groups.clusterItemRanges.size());
-  result.baseClusterGroupIndex                 = clusterGrouping.globalGroupOffset;
-  std::atomic<uint32_t> decimatedTriangleAlloc = 0;
-  std::atomic<nvclusterlod_Result> success                = nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
-  parallel_batches<Parallelize, 1>(clusterGrouping.groups.clusterItemRanges.size(), [&](uint64_t clusterGroupIndex) {
-    // The cluster group is formed by non-contiguous clusters but the decimator
-    // expects contiguous triangle vertex indices. We could reorder triangles by
-    // their cluster group, but that would mean reordering the original geometry
-    // too. Instead, cluster triangles are flattened into a contiguous vector.
+  Stopwatch sw(__func__);
 
-    if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+  // Create new DecimatedClusterGroups result
+  DecimatedClusterGroups decimated{};
+
+  // Compute vertices shared between cluster groups. These will be locked during
+  // decimation. Ideally specific edges would be locked to be less restrictive
+  // for LOD, instead of all edges between locked vertices.
+  decimated.globalLockedVertices = computeLockedVertices(inputMesh, triangleClusters, clusterGrouping);
+  decimated.decimatedTriangleStorage.resize(clusterGrouping.totalTriangleCount);  // space for worst case
+  decimated.groupTriangleRanges.resize(clusterGrouping.groups.clusterItemRanges.size());
+  decimated.groupQuadricErrors.resize(clusterGrouping.groups.clusterItemRanges.size());
+  decimated.baseClusterGroupIndex                         = clusterGrouping.globalGroupOffset;
+  std::atomic<uint32_t>            decimatedTriangleAlloc = 0;
+  std::atomic<nvclusterlod_Result> result                 = nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  std::atomic<uint32_t>            additionalVertexCount  = 0;
+  parallel_batches<Parallelize, 1>(clusterGrouping.groups.clusterItemRanges.size(), [&](uint64_t clusterGroupIndex) {
+    if(result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
       return;
     }
 
+    // The cluster group is formed by non-contiguous clusters but the decimator
+    // expects contiguous triangle vertex indices. We could reorder triangles by
+    // their cluster group, but that would mean reordering the original geometry
+    // too. Instead, cluster triangles are flattened into a contiguous vector.
     const nvcluster_Range&           clusterGroupRange = clusterGrouping.groups.clusterItemRanges[clusterGroupIndex];
     std::vector<vec3u>               clusterGroupTriangleVertices;
     clusterGroupTriangleVertices.reserve(clusterGroupRange.count * maxTrianglesPerCluster);
@@ -737,60 +825,54 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
     }
 
     // Decimate the cluster group
+    // TODO: in-place decimation?
     std::vector<vec3u> decimatedTriangleVertices(clusterGroupTriangleVertices.size());
-    constexpr float    targetError   = std::numeric_limits<float>::max();
-    float              absoluteError = 0.0f;
-    unsigned int options = meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute;  // no meshopt_SimplifyLockBorder as we only care about vertices shared between cluster groups
-    size_t desiredTriangleCount = size_t(float(clusterGroupTriangleVertices.size()) * lodLevelDecimationFactor);
-    size_t simplifiedTriangleCount =
-        meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
-                                       reinterpret_cast<const unsigned int*>(clusterGroupTriangleVertices.data()),
-                                       clusterGroupTriangleVertices.size() * 3,
-                                       reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
-                                       inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(), nullptr, 0,
-                                       nullptr, 0, result.globalLockedVertices.data(), desiredTriangleCount * 3,
-                                       targetError, options, &absoluteError)
-        / 3;
-
-    if(desiredTriangleCount < simplifiedTriangleCount)
+    uint32_t desiredTriangleCount    = uint32_t(float(clusterGroupTriangleVertices.size()) * lodLevelDecimationFactor);
+    float    quadricError            = 0.0f;
+    uint32_t simplifiedTriangleCount = 0;
+    if(decimateTrianglesCallback)
     {
-      DEBUG_PRINT("Warning: decimation failed (%zu < %zu). Retrying, ignoring topology\n", desiredTriangleCount, simplifiedTriangleCount);
-      std::vector<vec3u> positionUniqueTriangleVertices(clusterGroupTriangleVertices.size());
-      meshopt_generateShadowIndexBuffer(reinterpret_cast<unsigned int*>(positionUniqueTriangleVertices.data()),
-                                        reinterpret_cast<const unsigned int*>(clusterGroupTriangleVertices.data()),
-                                        clusterGroupTriangleVertices.size() * 3,
-                                        reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
-                                        inputMesh.vertexPositions.size(), sizeof(vec3f), inputMesh.vertexPositions.stride());
-      simplifiedTriangleCount =
-          meshopt_simplifyWithAttributes(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
-                                         reinterpret_cast<const unsigned int*>(positionUniqueTriangleVertices.data()),
-                                         positionUniqueTriangleVertices.size() * 3,
-                                         reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
-                                         inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(), nullptr,
-                                         0, nullptr, 0, result.globalLockedVertices.data(), desiredTriangleCount * 3,
-                                         targetError, options, &absoluteError)
-          / 3;
-      if(desiredTriangleCount < simplifiedTriangleCount)
+      nvclusterlod_DecimateTrianglesCallbackParams params{
+          .triangleVertices          = reinterpret_cast<const nvclusterlod_Vec3u*>(clusterGroupTriangleVertices.data()),
+          .vertexPositions           = reinterpret_cast<const nvcluster_Vec3f*>(inputMesh.vertexPositions.data()),
+          .vertexLockFlags           = decimated.globalLockedVertices.data(),
+          .decimatedTriangleVertices = reinterpret_cast<nvclusterlod_Vec3u*>(decimatedTriangleVertices.data()),
+          .triangleCount             = uint32_t(clusterGroupTriangleVertices.size()),
+          .vertexStride              = uint32_t(inputMesh.vertexPositions.stride()),
+          .vertexCount               = uint32_t(inputMesh.vertexPositions.size()),
+          .targetTriangleCount       = uint32_t(desiredTriangleCount),
+      };
+      nvclusterlod_DecimateTrianglesCallbackResult decimateResult;
+      if(!decimateTrianglesCallback(userData, &params, &decimateResult))
       {
-        DEBUG_PRINT("Warning: decimation failed (%zu < %zu). Retrying, ignoring locked\n", desiredTriangleCount, simplifiedTriangleCount);
-        simplifiedTriangleCount =
-            meshopt_simplifySloppy(reinterpret_cast<unsigned int*>(decimatedTriangleVertices.data()),
-                                   reinterpret_cast<const unsigned int*>(positionUniqueTriangleVertices.data()),
-                                   positionUniqueTriangleVertices.size() * 3,
-                                   reinterpret_cast<const float*>(inputMesh.vertexPositions.data()),
-                                   inputMesh.vertexPositions.size(), inputMesh.vertexPositions.stride(),
-                                   desiredTriangleCount * 3, targetError, &absoluteError)
-            / 3;
+        result = nvclusterlod_Result::NVCLUSTERLOD_ERROR_USER_DECIMATION_FAILED;
+        return;
+      }
+      simplifiedTriangleCount = decimateResult.decimatedTriangleCount;
+      quadricError            = decimateResult.quadricError;
+      decimatedTriangleVertices.resize(decimateResult.decimatedTriangleCount);
+      if(decimateResult.additionalVertexCount > 0)
+      {
+        additionalVertexCount.fetch_add(decimateResult.additionalVertexCount);
       }
     }
+    else
+    {
+#if NVCLUSTERLOD_HAS_MESHOPTIMIER
+      // Hard coded fallback to allow the compiler to optimize through the callback
+      simplifiedTriangleCount = decimateTrianglesDefault(Mesh{clusterGroupTriangleVertices, inputMesh.vertexPositions},
+                                                         decimated.globalLockedVertices, uint32_t(desiredTriangleCount),
+                                                         decimatedTriangleVertices, quadricError);
+#else
+      result = nvclusterlod_Result::NVCLUSTERLOD_ERROR_NO_DECIMATION_CALLBACK;
+      return;
+#endif
+    }
 
-    // Handle a case when meshopt_simplifySloppy() sometimes returns no
-    // triangles for very sparse geometry.
     if(simplifiedTriangleCount == 0)
     {
-      DEBUG_PRINT("Warning: decimation produced no triangles. Adding the first back\n");
-      simplifiedTriangleCount++;
-      decimatedTriangleVertices[0] = clusterGroupTriangleVertices[0];
+      result = nvclusterlod_Result::NVCLUSTERLOD_ERROR_EMPTY_DECIMATION_RESULT;
+      return;
     }
 
     // HACK: truncate triangles if decimation target was not met
@@ -822,28 +904,31 @@ static nvclusterlod_Result decimateClusterGroups(DecimatedClusterGroups& current
     // temporary buffer is needed and we can't write directly to the library
     // user's buffer because triangles must be ordered by cluster, which is
     // computed next.
-    if(groupDecimatedTrianglesOffset + decimatedTriangleVertices.size() > result.decimatedTriangleStorage.size())
+    if(groupDecimatedTrianglesOffset + decimatedTriangleVertices.size() > decimated.decimatedTriangleStorage.size())
     {
-      success = nvclusterlod_Result::NVCLUSTERLOD_ERROR_OUTPUT_MESH_OVERFLOW;
+      result = nvclusterlod_Result::NVCLUSTERLOD_ERROR_OUTPUT_MESH_OVERFLOW;
       return;
     }
-    std::ranges::copy(decimatedTriangleVertices, result.decimatedTriangleStorage.begin() + groupDecimatedTrianglesOffset);
+    std::ranges::copy(decimatedTriangleVertices, decimated.decimatedTriangleStorage.begin() + groupDecimatedTrianglesOffset);
 
-    result.groupTriangleRanges[clusterGroupIndex] = {uint32_t(groupDecimatedTrianglesOffset),
-                                                     uint32_t(decimatedTriangleVertices.size())};
-    result.groupQuadricErrors[clusterGroupIndex]  = absoluteError;
+    decimated.groupTriangleRanges[clusterGroupIndex] = {uint32_t(groupDecimatedTrianglesOffset),
+                                                        uint32_t(decimatedTriangleVertices.size())};
+    decimated.groupQuadricErrors[clusterGroupIndex]  = quadricError;
   });
 
-  if(success != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+  if(result != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
   {
-    return success;
+    return Expected<DecimatedClusterGroups>(result);
   }
 
-  result.decimatedTriangleStorage.resize(decimatedTriangleAlloc);
-  result.mesh = {result.decimatedTriangleStorage, inputMesh.vertexPositions};
+  decimated.decimatedTriangleStorage.resize(decimatedTriangleAlloc);
+  decimated.mesh = Mesh{decimated.decimatedTriangleStorage,
+                        ArrayView{inputMesh.vertexPositions.data(),
+                                  uint32_t(inputMesh.vertexPositions.size()) + additionalVertexCount.load(),
+                                  inputMesh.vertexPositions.stride()}};
+  decimated.globalLockedVertices.resize(decimated.mesh.vertexPositions.size(), 0);  // any new vertices are not locked
 
-  std::swap(current, result);
-  return nvclusterlod_Result::NVCLUSTERLOD_SUCCESS;
+  return Expected<DecimatedClusterGroups>(std::move(decimated));
 }
 
 // Returns the ceiling of an integer division.
@@ -852,15 +937,11 @@ static uint32_t divCeil(const uint32_t& a, const uint32_t& b)
   return (a + b - 1) / b;
 }
 
-static nvclusterlod_Result getMeshRequirements(const MeshInput&         input,
-                                               const nvcluster_Config&  groupConfig,
-                                               const nvcluster_Config&  clusterConfig,
-                                               float                    decimationFactor,
-                                               nvclusterlod_MeshCounts& outputRequiredCounts)
+static nvclusterlod_Result getMeshRequirements(const MeshInput& input, nvclusterlod_MeshCounts& outputRequiredCounts)
 {
-  uint32_t triangleCount  = uint32_t(input.triangleVertices.size());
-  uint32_t minClusterSize = clusterConfig.minClusterSize;
-  if(clusterConfig.maxClusterVertices != ~0u)
+  uint32_t triangleCount  = uint32_t(input.mesh.triangleVertices.size());
+  uint32_t minClusterSize = input.capi.clusterConfig.minClusterSize;
+  if(input.capi.clusterConfig.maxClusterVertices != ~0u)
   {
     // Using a vertex limit reduces the minimum cluster size to 1, resulting in
     // a very large worst case of one cluster per triangle even though we rarely
@@ -870,9 +951,9 @@ static nvclusterlod_Result getMeshRequirements(const MeshInput&         input,
 
   assert(triangleCount != 0);
   uint32_t lod0ClusterCount       = divCeil(triangleCount, minClusterSize) + 1;
-  uint32_t idealLevelCount        = uint32_t(ceilf(-logf(float(lod0ClusterCount)) / logf(decimationFactor)));
+  uint32_t idealLevelCount        = uint32_t(ceilf(-logf(float(lod0ClusterCount)) / logf(input.capi.decimationFactor)));
   uint32_t idealClusterCount      = lod0ClusterCount * idealLevelCount;
-  uint32_t idealClusterGroupCount = divCeil(idealClusterCount, groupConfig.minClusterSize);
+  uint32_t idealClusterGroupCount = divCeil(idealClusterCount, input.capi.groupConfig.minClusterSize);
 
   // TODO: actually validate against overflow
   outputRequiredCounts = nvclusterlod_MeshCounts{
@@ -885,16 +966,11 @@ static nvclusterlod_Result getMeshRequirements(const MeshInput&         input,
 }
 
 template <bool Parallelize>
-nvclusterlod_Result buildMesh(nvclusterlod_Context    context,
-                              const MeshInput&        input,
-                              const nvcluster_Config& groupConfig,
-                              const nvcluster_Config& clusterConfig,
-                              float                   decimationFactor,
-                              MeshOutput&             output)
+nvclusterlod_Result buildMesh(nvclusterlod_Context context, const MeshInput& input, MeshOutput& output)
 {
   Stopwatch sw(__func__);
 
-  if(clusterConfig.maxClusterVertices != ~0u && clusterConfig.itemVertexCount != 3)
+  if(input.capi.clusterConfig.maxClusterVertices != ~0u && input.capi.clusterConfig.itemVertexCount != 3)
   {
     // User wants to set a vertex limit. Only triangles are supported, which
     // have 3 vertices.
@@ -903,17 +979,17 @@ nvclusterlod_Result buildMesh(nvclusterlod_Context    context,
 
   // Populate initial mesh input in a common structure. Subsequent passes
   // contain results from the previous level of detail.
-  nvclusterlod::DecimatedClusterGroups decimatedClusterGroups{
-      .groupTriangleRanges = {{0, uint32_t(input.triangleVertices.size())}},  // The first pass uses the entire input mesh, hence we only have one large group of triangles
-      .mesh = input,
+  Expected<DecimatedClusterGroups> decimatedClusterGroups(DecimatedClusterGroups{
+      .groupTriangleRanges = {{0, uint32_t(input.mesh.triangleVertices.size())}},  // The first pass uses the entire input mesh, hence we only have one large group of triangles
+      .mesh = input.mesh,
       .decimatedTriangleStorage = {},  // initial source is input.mesh so this is empty. Further passes will write the index buffer for the decimated triangles of the LODs
       .groupQuadricErrors = {0.0f},    // In the first pass no error has yet been accumulated
       .baseClusterGroupIndex = NVCLUSTERLOD_ORIGINAL_MESH_GROUP,  // The first group represents the original mesh, hence we mark it as the original group
-      .globalLockedVertices = std::vector<uint8_t>(input.vertexPositions.size(), 0),  // No vertices are locked in the original mesh
-  };
+      .globalLockedVertices = std::vector<uint8_t>(input.mesh.vertexPositions.size(), 0),  // No vertices are locked in the original mesh
+  });
 
   // Initial clustering
-  DEBUG_PRINT("Initial clustering (%u triangles)\n", uint32_t(input.triangleVertices.size()));
+  DEBUG_PRINT("Initial clustering (%u triangles)\n", uint32_t(input.mesh.triangleVertices.size()));
 
 #if PRINT_OPS
   uint32_t lodLevel = 0;
@@ -932,44 +1008,36 @@ nvclusterlod_Result buildMesh(nvclusterlod_Context    context,
     // a range of triangles within the mesh.
     // Later iterations will take the clusters from the previous iteration as input. The function generateTriangleClusters
     // will then create a set of clusters within each of the input clusters.
-    nvclusterlod::TriangleClusters triangleClusters{};
-    if(const nvclusterlod_Result r = generateTriangleClusters<Parallelize>(context->clusterContext, decimatedClusterGroups,
-                                                                           clusterConfig, triangleClusters);
-       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    Expected<TriangleClusters> triangleClusters =
+        generateTriangleClusters<Parallelize>(context->clusterContext, *decimatedClusterGroups, input.capi.clusterConfig);
+    if(!triangleClusters.has_value())
     {
-      return r;
+      return triangleClusters.error;
     }
 
     // Compute the adjacency between clusters: for each cluster clusterAdjacency will contain a map of
     // its adjacent clusters along with the number of vertices shared with each of those clusters. The adjacency information is symmetric.
     // This is important as it feeds into the weights for making groups of clusters.
-    nvclusterlod::ClusterAdjacency clusterAdjacency{};
-    if(const nvclusterlod_Result r = computeClusterAdjacency(decimatedClusterGroups, triangleClusters, clusterAdjacency);
-       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
-    {
-      return r;
-    }
-
+    ClusterAdjacency clusterAdjacency = computeClusterAdjacency(*decimatedClusterGroups, *triangleClusters);
 
     // Make clusters of clusters, called "cluster groups" or just "groups".
-    nvclusterlod::ClusterGroups clusterGroups{};
-    if(const nvclusterlod_Result r =
-           groupClusters<Parallelize>(context->clusterContext, triangleClusters, groupConfig,
-                                      output.groupClusterRanges.allocatedCount(), clusterAdjacency, clusterGroups);
-       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    Expected<ClusterGroups> clusterGroups =
+        groupClusters<Parallelize>(context->clusterContext, *triangleClusters, input.capi.groupConfig,
+                                   output.groupClusterRanges.allocatedCount(), clusterAdjacency);
+    if(!clusterGroups.value.has_value())
     {
-      return r;
+      return clusterGroups.error;
     }
 
     // Write the generated clusters and cluster groups representing the mesh at the current LOD
-    if(const nvclusterlod_Result r = nvclusterlod::writeClusters(decimatedClusterGroups, clusterGroups, triangleClusters, output);
+    if(const nvclusterlod_Result r = nvclusterlod::writeClusters(*decimatedClusterGroups, *clusterGroups, *triangleClusters, output);
        r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
     {
       return r;
     }
 
     // Exit when there is just one cluster, meaning the decimation reached the level where the entire mesh geometry fits within a single cluster
-    uint32_t clusterCount = uint32_t(triangleClusters.clustering.clusterItemRanges.size());
+    uint32_t clusterCount = uint32_t(triangleClusters->clustering.clusterItemRanges.size());
     if(clusterCount <= 1)
     {
       if(clusterCount != 1)
@@ -982,17 +1050,18 @@ nvclusterlod_Result buildMesh(nvclusterlod_Context    context,
     // Decimate within cluster groups to create the next LOD level
     DEBUG_PRINT("Decimating lod %d (%d clusters)\n", lodLevel++, clusterCount);
     float maxDecimationFactor   = float(clusterCount - 1) / float(clusterCount);
-    float levelDecimationFactor = std::min(maxDecimationFactor, decimationFactor);
-    if(const nvclusterlod_Result r = decimateClusterGroups<Parallelize>(decimatedClusterGroups, triangleClusters, clusterGroups,
-                                                                        clusterConfig.maxClusterSize, levelDecimationFactor);
-       r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
+    float levelDecimationFactor = std::min(maxDecimationFactor, input.capi.decimationFactor);
+    decimatedClusterGroups = decimateClusterGroups<Parallelize>(decimatedClusterGroups->mesh, *triangleClusters, *clusterGroups,
+                                                                input.capi.clusterConfig.maxClusterSize, levelDecimationFactor,
+                                                                input.capi.decimateTrianglesCallback, input.capi.userData);
+    if(!decimatedClusterGroups.has_value())
     {
-      return r;
+      return decimatedClusterGroups.error;
     }
 
     // Make sure the number of triangles is always going down. This may fail for
     // high decimation factors.
-    size_t triangleCount = decimatedClusterGroups.decimatedTriangleStorage.size();
+    size_t triangleCount = decimatedClusterGroups->decimatedTriangleStorage.size();
     if(triangleCount == lastTriangleCount && --triangleCountCanary <= 0)
     {
       return nvclusterlod_Result::NVCLUSTERLOD_ERROR_CLUSTER_COUNT_NOT_DECREASING;
@@ -1001,9 +1070,9 @@ nvclusterlod_Result buildMesh(nvclusterlod_Context    context,
 
     // Per-group quadric errors are written separately as the final LOD level
     // of groups will not decimate and need zeroes written instead.
-    for(size_t i = 0; i < decimatedClusterGroups.groupQuadricErrors.size(); i++)
+    for(size_t i = 0; i < decimatedClusterGroups->groupQuadricErrors.size(); i++)
     {
-      output.groupQuadricErrors.append(decimatedClusterGroups.groupQuadricErrors[i]);
+      output.groupQuadricErrors.append(decimatedClusterGroups->groupQuadricErrors[i]);
     }
   }
 
@@ -1020,8 +1089,7 @@ nvclusterlod_Result nvclusterlodGetMeshRequirements(nvclusterlod_Context /* cont
                                                     const nvclusterlod_MeshInput* input,
                                                     nvclusterlod_MeshCounts*      outputRequiredCounts)
 {
-  return getMeshRequirements(nvclusterlod::MeshInput::fromCAPI(*input), input->groupConfig, input->clusterConfig,
-                             input->decimationFactor, *outputRequiredCounts);
+  return nvclusterlod::getMeshRequirements(nvclusterlod::MeshInput(*input), *outputRequiredCounts);
 }
 
 // Main C API entry point, adding bounds checking
@@ -1033,8 +1101,7 @@ nvclusterlod_Result nvclusterlodBuildMesh(nvclusterlod_Context context, const nv
 #else
   auto buildMesh = nvclusterlod::buildMesh<false>;
 #endif
-  if(const nvclusterlod_Result r = buildMesh(context, nvclusterlod::MeshInput::fromCAPI(*input), input->groupConfig,
-                                             input->clusterConfig, input->decimationFactor, outputAllocator);
+  if(const nvclusterlod_Result r = buildMesh(context, nvclusterlod::MeshInput(*input), outputAllocator);
      r != nvclusterlod_Result::NVCLUSTERLOD_SUCCESS)
   {
     return r;

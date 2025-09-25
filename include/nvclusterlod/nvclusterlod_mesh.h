@@ -43,6 +43,46 @@ extern "C" {
     .minClusterSize = 24, .maxClusterSize = 32, .costUnderfill = 0.5f, .costOverlap = 0.0f, .preSplitThreshold = 0,    \
   }
 
+typedef struct nvclusterlod_DecimateTrianglesCallbackParams
+{
+  // Mesh data to decimate
+  const nvclusterlod_Vec3u* triangleVertices NVCLUSTERLOD_DEFAULT(nullptr);
+  const nvcluster_Vec3f* vertexPositions     NVCLUSTERLOD_DEFAULT(nullptr);
+
+  // One byte per vertex. 1 if the vertex is locked, 0 otherwise.
+  const uint8_t* vertexLockFlags NVCLUSTERLOD_DEFAULT(nullptr);
+
+  // Output location to write decimated triangles. Has space for triangleCount,
+  // but the callback should produce targetTriangleCount.
+  nvclusterlod_Vec3u* decimatedTriangleVertices NVCLUSTERLOD_DEFAULT(nullptr);
+
+  uint32_t triangleCount       NVCLUSTERLOD_DEFAULT(0u);
+  uint32_t vertexStride        NVCLUSTERLOD_DEFAULT(0u);
+  uint32_t vertexCount         NVCLUSTERLOD_DEFAULT(0u);
+  uint32_t targetTriangleCount NVCLUSTERLOD_DEFAULT(0u);
+} nvclusterlod_DecimateTrianglesCallbackParams;
+
+typedef struct nvclusterlod_DecimateTrianglesCallbackResult
+{
+  uint32_t decimatedTriangleCount NVCLUSTERLOD_DEFAULT(0u);
+  uint32_t additionalVertexCount  NVCLUSTERLOD_DEFAULT(0u);
+  float quadricError              NVCLUSTERLOD_DEFAULT(0.0f);
+} nvclusterlod_DecimateTrianglesCallbackResult;
+
+// Callback type for custom decimation, e.g. to allow preserving UV seams or
+// weight edge collapses based on vertex attributes. Must be thread-safe. The
+// user writes targetTriangleCount triangles into decimatedTriangleVertices,
+// provides the number written and geometric quadric error due to the lower
+// detail. See internal decimateTrianglesDefault() for an example
+// implementation. If any new vertices are generated, the user is responsible
+// for over-allocating the input mesh and any synchroniation needed. Returning
+// NVCLUSTER_FALSE or zero decimatedTriangleCount will fail the overall
+// operation. Note that the triangles may reference a small subset of vertices,
+// which is all vertices for the whole mesh.
+typedef nvcluster_Bool (*nvclusterlod_DecimateTrianglesCallback)(void* userData,
+                                                                 const nvclusterlod_DecimateTrianglesCallbackParams* params,
+                                                                 nvclusterlod_DecimateTrianglesCallbackResult* result);
+
 // Input mesh and clustering parameters used to generate decimated LODs.
 typedef struct nvclusterlod_MeshInput
 {
@@ -71,6 +111,13 @@ typedef struct nvclusterlod_MeshInput
 
   // Decimation factor applied between successive LODs
   float decimationFactor NVCLUSTERLOD_DEFAULT(0.0f);
+
+  // Optional user data passed to callbacks
+  void* userData NVCLUSTERLOD_DEFAULT(nullptr);
+
+  // Optional callback to override the default triangle decimation. Mandatory if
+  // compiling with the cmake option NVCLUSTERLOD_FETCH_MESHOPTIMIZER OFF.
+  nvclusterlod_DecimateTrianglesCallback decimateTrianglesCallback NVCLUSTERLOD_DEFAULT(nullptr);
 } nvclusterlod_MeshInput;
 
 // Memory requirements for the output storage of the mesh LODs
