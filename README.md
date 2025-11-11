@@ -1,5 +1,13 @@
 # nv_cluster_lod_builder <!-- omit from toc -->
 
+> [!IMPORTANT]
+> This repository has been archived and is no longer maintained by NVIDIA. It
+> was an R&D project to provide a simple and quick start for ray tracing
+> continuous LOD with
+> [nv_cluster_builder](https://github.com/nvpro-samples/nv_cluster_builder). For
+> similar actively maintained code, please refer to
+> [`meshoptimizer/demo/clusterlod.h`](https://github.com/zeux/meshoptimizer/blob/master/demo/clusterlod.h).
+
 ![](doc/lod_stitch.svg)
 
 **nv_cluster_lod_builder** is a _continuous_ level of detail (LOD) mesh library.

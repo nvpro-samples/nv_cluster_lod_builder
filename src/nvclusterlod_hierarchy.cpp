@@ -115,9 +115,7 @@ static inline nvclusterlod_Result makeBoundingSphere(std::span<const nvclusterlo
   // Grow the sphere to include the farthest sphere
   const nvclusterlod::Sphere f = farthestSphere(spheres, sphere);
   sphere.radius                = nvcluster::length(f.center - sphere.center) + f.radius;
-  sphere.radius                = std::nextafter(sphere.radius, std::numeric_limits<float>::max());
-  sphere.radius = std::nextafter(sphere.radius, std::numeric_limits<float>::max());  // fixes a test failure. or * 1.0001?
-  sphere.radius = std::nextafter(sphere.radius, std::numeric_limits<float>::max());
+  sphere.radius *= (1.0f + 5.0f * std::numeric_limits<float>::epsilon());  // try to ensure children are bounded despite rounding errors
   if(std::isnan(sphere.center[0]) || std::isnan(sphere.center[1]) || std::isnan(sphere.center[2]) || std::isnan(sphere.radius))
   {
     return nvclusterlod_Result::NVCLUSTERLOD_ERROR_PRODUCED_NAN_BOUNDING_SPHERES;
